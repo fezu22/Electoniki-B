@@ -4,7 +4,7 @@ import crypto from 'crypto';
 import nodemailer from 'nodemailer';
 import { GoogleGenAI } from '@google/genai';
 import { db, runInTransaction } from '../db.js';
-import { matchProduct, normalizeKey } from '../../../shared/productMatching.js';
+import { matchProduct, normalizeKey } from '../utils/productMatching.js';
 import {
   AUTH_COOKIE_NAME,
   AUTH_COOKIE_MAX_AGE_MS,

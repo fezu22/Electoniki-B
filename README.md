@@ -10,4 +10,6 @@ Express API and MongoDB data layer for the Electroniki shop-management app.
 
 `GEMINI_API_KEY` enables invoice OCR. SMTP variables (`SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM`) enable password-reset emails. Do not commit `.env` or database files.
 
+The backend runs as an API by default. To also serve a built frontend in production, set `FRONTEND_DIST_DIR` to the frontend build directory.
+
 Run the automated backend tests with `npm test`.
