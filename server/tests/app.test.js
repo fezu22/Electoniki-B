@@ -303,6 +303,20 @@ test('Multi-tenant isolation, RBAC permissions, sales, returns, installments, an
     assert.equal(ownerSettingsUpdate.status, 200);
     assert.equal(ownerSettingsUpdate.data.shop.name, 'First Flagship Store');
     assert.equal(ownerSettingsUpdate.data.shop.whatsapp, '+923009998877');
+    const invalidAutomationSettings = await api('/settings', {
+      method: 'PUT', token: ownerToken,
+      body: { name: 'First Flagship Store', automation: { lowStockAlertsEnabled: true, lowStockRecipients: ['03001234567', 'bad'] } },
+    });
+    assert.equal(invalidAutomationSettings.status, 400, 'low-stock automation requires two valid WhatsApp numbers');
+    const automationSettings = await api('/settings', {
+      method: 'PUT', token: ownerToken,
+      body: { name: 'First Flagship Store', automation: {
+        installmentRemindersEnabled: true,
+        lowStockAlertsEnabled: true,
+        lowStockRecipients: ['03001234567', '+923007654321'],
+      } },
+    });
+    assert.deepEqual(automationSettings.data.shop.automation.lowStockRecipients, ['923001234567', '923007654321']);
 
     const productRes = await api('/products', {
       method: 'POST', token: ownerToken,
@@ -714,6 +728,19 @@ test('Installment sales save customer and guarantor photos inside one details ob
     assert.equal(storedPlan.installmentDetails.guarantor.photoDataUrl, guarantorPhoto);
     assert.equal(storedPlan.installmentDetails.plan.months, 10);
     assert.equal(storedPlan.installmentDetails.customer.cnic, '12345-1234567-1');
+    const missingConsent = await api(`/installments/${storedPlan.id}/reminders`, {
+      method: 'PATCH', token, body: { enabled: true, customerConsent: false },
+    });
+    assert.equal(missingConsent.status, 400);
+    const enabledReminder = await api(`/installments/${storedPlan.id}/reminders`, {
+      method: 'PATCH', token, body: { enabled: true, customerConsent: true },
+    });
+    assert.equal(enabledReminder.status, 200);
+    assert.equal(enabledReminder.data.plan.whatsappReminderEnabled, true);
+    const disabledReminder = await api(`/installments/${storedPlan.id}/reminders`, {
+      method: 'PATCH', token, body: { enabled: false, customerConsent: false },
+    });
+    assert.equal(disabledReminder.data.plan.whatsappReminderEnabled, false);
 
     const invalidPhotoSale = await api('/sales', { token, body: {
       customerId: 'new', saleType: 'installment', customerInfo: { name: 'Invalid Photo', customerPhoto: 'data:application/pdf;base64,AA==' },
@@ -767,5 +794,75 @@ test('Shop accounts require eight-character passwords and reset codes lock after
   } finally {
     server.closeAllConnections();
     await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test('WhatsApp automations deduplicate monthly reminders and rearm stock alerts after restocking', async () => {
+  const { db, resetInMemoryStateForTests } = await import('../db.js');
+  const { runAutomationCycle } = await import('../services/automationScheduler.js');
+  const envKeys = [
+    'WHATSAPP_ACCESS_TOKEN', 'WHATSAPP_PHONE_NUMBER_ID', 'WHATSAPP_GRAPH_API_VERSION',
+    'WHATSAPP_TEMPLATE_LANGUAGE', 'WHATSAPP_INSTALLMENT_TEMPLATE', 'WHATSAPP_LOW_STOCK_TEMPLATE',
+  ];
+  const previousEnv = Object.fromEntries(envKeys.map((key) => [key, process.env[key]]));
+  const originalFetch = globalThis.fetch;
+  const sent = [];
+  envKeys.forEach((key) => delete process.env[key]);
+  process.env.WHATSAPP_ACCESS_TOKEN = 'test-token';
+  process.env.WHATSAPP_PHONE_NUMBER_ID = 'test-phone-id';
+  globalThis.fetch = async (url, options) => {
+    sent.push({ url, body: JSON.parse(options.body) });
+    return { ok: true, status: 200, json: async () => ({ messages: [{ id: `test-${sent.length}` }] }) };
+  };
+
+  try {
+    resetInMemoryStateForTests();
+    const shop = await db.Shop.create({
+      name: 'Automation Test Shop',
+      automation: {
+        installmentRemindersEnabled: true,
+        lowStockAlertsEnabled: true,
+        lowStockRecipients: ['03001234567', '+923007654321'],
+      },
+    });
+    const product = await db.Product.create({
+      shopId: shop.id, name: 'Test Fan', code: 'FAN-01', stock: 2, reorderThreshold: 5,
+    });
+    const plan = await db.InstallmentPlan.create({
+      shopId: shop.id, planNo: 'PLAN-TEST-1', customerName: 'Test Customer',
+      whatsapp: '03007654321', totalAmount: 12000, paid: 2000, balance: 10000,
+      monthlyAmount: 1000, nextDueDate: '2026-10-01',
+      whatsappReminderEnabled: true, whatsappReminderConsent: true,
+    });
+
+    await runAutomationCycle(new Date('2026-10-23T06:00:00.000Z'));
+    assert.equal(sent.length, 3, 'one customer reminder and two recipient stock alerts are sent');
+    assert.deepEqual(
+      sent.slice(0, 2).map((message) => message.body.to),
+      ['923001234567', '923007654321']
+    );
+    assert.equal(sent[0].body.template.name, 'low_stock_alert');
+    assert.equal(sent[2].body.type, 'template');
+    assert.equal(sent[2].body.template.name, 'installment_payment_reminder');
+    assert.equal(sent[2].body.to, '923007654321');
+
+    await runAutomationCycle(new Date('2026-10-23T06:10:00.000Z'));
+    assert.equal(sent.length, 3, 'the same month and low-stock period do not send duplicates');
+
+    await db.Product.updateOne({ _id: product.id, shopId: shop.id }, { stock: 6 });
+    await runAutomationCycle(new Date('2026-10-23T06:15:00.000Z'));
+    await db.Product.updateOne({ _id: product.id, shopId: shop.id }, { stock: 4 });
+    await runAutomationCycle(new Date('2026-10-23T06:20:00.000Z'));
+    assert.equal(sent.length, 5, 'restocking above threshold rearms both recipient alerts');
+
+    await runAutomationCycle(new Date('2026-11-23T06:00:00.000Z'));
+    assert.equal(sent.length, 6, 'the unpaid plan gets one reminder in the next due month');
+    assert.equal((await db.InstallmentPlan.findById(plan.id)).lastWhatsAppReminderMonth, '2026-11');
+  } finally {
+    globalThis.fetch = originalFetch;
+    for (const key of envKeys) {
+      if (previousEnv[key] === undefined) delete process.env[key];
+      else process.env[key] = previousEnv[key];
+    }
   }
 });

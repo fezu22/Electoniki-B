@@ -17,6 +17,14 @@ const shopSchema = new Schema(
     currency: { type: String, default: 'PKR' },
     openingCash: { type: Number, default: 0 },
     taxNumber: { type: String, default: '' },
+    automation: {
+      type: Schema.Types.Mixed,
+      default: () => ({
+        installmentRemindersEnabled: false,
+        lowStockAlertsEnabled: false,
+        lowStockRecipients: [],
+      }),
+    },
   },
   { timestamps: true }
 );
@@ -52,6 +60,7 @@ const productSchema = new Schema(
     price: { type: Number, required: true, min: 0 },
     stock: { type: Number, default: 0, min: 0 },
     reorderThreshold: { type: Number, default: 5, min: 0 },
+    lowStockNotifiedRecipients: { type: [String], default: [] },
     active: { type: Boolean, default: true },
   },
   { timestamps: true }
@@ -177,6 +186,9 @@ const installmentPlanSchema = new Schema(
     installmentPercent: { type: Number, default: 0 },
     startDate: { type: String, default: '' },
     nextDueDate: { type: String, default: '' },
+    whatsappReminderEnabled: { type: Boolean, default: false },
+    whatsappReminderConsent: { type: Boolean, default: false },
+    lastWhatsAppReminderMonth: { type: String, default: '' },
     status: { type: String, default: 'Active' },
   },
   { timestamps: true }

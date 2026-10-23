@@ -5,6 +5,7 @@ import nodemailer from 'nodemailer';
 import { GoogleGenAI } from '@google/genai';
 import { db, runInTransaction } from '../db.js';
 import { matchProduct, normalizeKey } from '../utils/productMatching.js';
+import { isWhatsAppAutomationConfigured, normalizeWhatsAppNumber } from '../utils/whatsappCloud.js';
 import {
   AUTH_COOKIE_NAME,
   AUTH_COOKIE_MAX_AGE_MS,
@@ -486,7 +487,7 @@ async function buildShopBootstrap(shopId, currentUser) {
   }));
 
   return {
-    shop,
+    shop: shop ? { ...shop, whatsappAutomationConfigured: isWhatsAppAutomationConfigured() } : shop,
     user: currentUser,
     users,
     products,
@@ -532,7 +533,10 @@ apiRouter.get('/settings', async (req, res) => {
     active: u.active !== false,
     lastLoginAt: u.lastLoginAt,
   }));
-  return res.json({ shop, users });
+  return res.json({
+    shop: shop ? { ...shop, whatsappAutomationConfigured: isWhatsAppAutomationConfigured() } : shop,
+    users,
+  });
 });
 
 apiRouter.put('/settings', requireOwner, async (req, res) => {
@@ -548,11 +552,28 @@ apiRouter.put('/settings', requireOwner, async (req, res) => {
       openingCash,
       taxNumber,
       currency,
+      automation,
     } = req.body || {};
 
     const cleanName = String(name || '').trim();
     if (!cleanName) {
       return res.status(400).json({ error: 'Shop name cannot be empty.' });
+    }
+
+    const previousAutomation = req.shop.automation || {};
+    const nextAutomation = {
+      installmentRemindersEnabled: Boolean(
+        automation?.installmentRemindersEnabled ?? previousAutomation.installmentRemindersEnabled
+      ),
+      lowStockAlertsEnabled: Boolean(
+        automation?.lowStockAlertsEnabled ?? previousAutomation.lowStockAlertsEnabled
+      ),
+      lowStockRecipients: Array.isArray(automation?.lowStockRecipients)
+        ? [...new Set(automation.lowStockRecipients.map(normalizeWhatsAppNumber).filter(Boolean))].slice(0, 2)
+        : [...new Set((previousAutomation.lowStockRecipients || []).map(normalizeWhatsAppNumber).filter(Boolean))].slice(0, 2),
+    };
+    if (nextAutomation.lowStockAlertsEnabled && nextAutomation.lowStockRecipients.length !== 2) {
+      return res.status(400).json({ error: 'Enter two valid WhatsApp numbers before enabling low-stock alerts.' });
     }
 
     const patch = {
@@ -566,6 +587,7 @@ apiRouter.put('/settings', requireOwner, async (req, res) => {
       openingCash: openingCash !== undefined ? num(openingCash) : num(req.shop.openingCash),
       taxNumber: String(taxNumber ?? req.shop.taxNumber ?? '').trim(),
       currency: String(currency || 'PKR').trim(),
+      automation: nextAutomation,
     };
 
     const updated = await db.Shop.updateOne({ _id: req.shopId }, patch);
@@ -1522,6 +1544,35 @@ apiRouter.post('/installments/plans', async (req, res) => {
   }
 });
 
+apiRouter.patch('/installments/:planId/reminders', requireOwner, async (req, res) => {
+  try {
+    const { enabled, customerConsent } = req.body || {};
+    const shouldEnable = enabled === true;
+    if (shouldEnable && customerConsent !== true) {
+      return res.status(400).json({ error: 'Customer consent is required before enabling WhatsApp reminders.' });
+    }
+    const plan = await db.InstallmentPlan.findOne({ _id: req.params.planId, shopId: req.shopId });
+    if (!plan) return res.status(404).json({ error: 'Installment plan not found.' });
+    if (shouldEnable && Number(plan.balance || 0) <= 0) {
+      return res.status(400).json({ error: 'This plan is already paid in full.' });
+    }
+    if (shouldEnable && !normalizeWhatsAppNumber(plan.whatsapp || plan.phone)) {
+      return res.status(400).json({ error: 'Add a valid customer WhatsApp number before enabling reminders.' });
+    }
+
+    const updated = await db.InstallmentPlan.updateOne(
+      { _id: plan.id, shopId: req.shopId },
+      {
+        whatsappReminderEnabled: shouldEnable,
+        whatsappReminderConsent: shouldEnable && customerConsent === true,
+      }
+    );
+    return res.json({ plan: updated });
+  } catch (err) {
+    return res.status(500).json({ error: 'Could not update installment reminder settings.' });
+  }
+});
+
 apiRouter.post('/installments/:planId/pay', async (req, res) => {
   try {
     const { amount, method = 'cash', bankName = '', reference = '', note = '', idempotencyKey } = req.body || {};
@@ -1566,6 +1617,7 @@ apiRouter.post('/installments/:planId/pay', async (req, res) => {
           balance: calc.newBalance,
           status: calc.newStatus,
           nextDueDate: calc.newStatus === 'Paid' ? 'Completed' : pakistanDateString(nextDue),
+          whatsappReminderEnabled: calc.newBalance > 0 && plan.whatsappReminderEnabled === true,
         }
       );
 

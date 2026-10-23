@@ -6,6 +6,7 @@ import rateLimit from 'express-rate-limit';
 import path from 'path';
 import { connectDatabase } from './db.js';
 import { apiRouter } from './routes/api.js';
+import { startAutomationScheduler } from './services/automationScheduler.js';
 
 export function createApp() {
   const app = express();
@@ -50,6 +51,7 @@ export function createApp() {
 
 export async function startServer() {
   await connectDatabase();
+  startAutomationScheduler();
 
   const app = createApp();
   const port = Number(process.env.PORT || 3000);
