@@ -25,6 +25,7 @@ const COLLECTIONS = [
   'Cheque',
   'CustomerReturn',
   'HeldOrder',
+  'CashSession',
   'AuditEvent',
 ];
 

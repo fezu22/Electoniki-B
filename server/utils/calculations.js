@@ -13,6 +13,21 @@ export function signedNum(v) {
   return Number.isFinite(n) ? n : 0;
 }
 
+export function calculateCashSessionTotals(transactions, session, endTime = Date.now()) {
+  const start = new Date(session.openedAt).getTime();
+  let cashIn = 0;
+  let cashOut = 0;
+  for (const transaction of transactions) {
+    if (String(transaction.method || '').toLowerCase() !== 'cash') continue;
+    const createdAt = new Date(transaction.createdAt || 0).getTime();
+    if (!Number.isFinite(createdAt) || createdAt < start || createdAt > endTime) continue;
+    const amount = num(transaction.amount);
+    if (transaction.direction === 'in') cashIn += amount;
+    if (transaction.direction === 'out') cashOut += amount;
+  }
+  return { cashIn, cashOut, expectedClosingAmount: num(session.openingAmount) + cashIn - cashOut };
+}
+
 const STOCK_WARRANTY_OPTIONS = new Set(Array.from({ length: 16 }, (_, index) => `${(index + 1) * 3} Months`));
 
 /**

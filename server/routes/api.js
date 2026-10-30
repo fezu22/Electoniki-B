@@ -5,7 +5,6 @@ import nodemailer from 'nodemailer';
 import { GoogleGenAI } from '@google/genai';
 import { db, runInTransaction } from '../db.js';
 import { matchProduct, normalizeKey } from '../utils/productMatching.js';
-import { isWhatsAppAutomationConfigured, normalizeWhatsAppNumber } from '../utils/whatsappCloud.js';
 import {
   AUTH_COOKIE_NAME,
   AUTH_COOKIE_MAX_AGE_MS,
@@ -16,6 +15,7 @@ import {
   verifyAuthToken,
   requireAuth,
   requireOwner,
+  requireSuperAdmin,
 } from '../middleware/auth.js';
 import {
   num,
@@ -27,6 +27,7 @@ import {
   calculateInstallmentPayment,
   validateStockReceipt,
   calculateShopFinancialSummary,
+  calculateCashSessionTotals,
 } from '../utils/calculations.js';
 
 export const apiRouter = express.Router();
@@ -355,6 +356,226 @@ apiRouter.post('/auth/reset-password', async (req, res) => {
 
 apiRouter.use(requireAuth);
 
+apiRouter.use('/admin', requireSuperAdmin);
+
+function serializeAdminUser(user, shopName = '') {
+  return {
+    id: user.id,
+    shopId: user.shopId,
+    shopName,
+    name: user.name,
+    email: user.email,
+    role: user.role,
+    active: user.active !== false,
+    lastLoginAt: user.lastLoginAt || null,
+    createdAt: user.createdAt || null,
+  };
+}
+
+apiRouter.get('/admin/summary', async (_req, res, next) => {
+  try {
+    const [allShops, allUsers] = await Promise.all([db.Shop.find({}), db.User.find({})]);
+    const shops = allShops.filter((shop) => shop.platformAdminWorkspace !== true);
+    const users = allUsers.filter((user) => user.role !== 'super_admin');
+    const shopNames = new Map(shops.map((shop) => [String(shop.id), shop.name]));
+    return res.json({
+      shops: shops.map((shop) => ({
+        id: shop.id,
+        name: shop.name,
+        phone: shop.phone || '',
+        whatsapp: shop.whatsapp || '',
+        city: shop.city || '',
+        address: shop.address || '',
+        invoiceDesign: {
+          theme: shop.invoiceDesign?.theme || 'blue',
+          accentColor: shop.invoiceDesign?.accentColor || '#0757a6',
+          logo: shop.invoiceDesign?.logo || '',
+        },
+        createdAt: shop.createdAt || null,
+        usersCount: users.filter((user) => String(user.shopId) === String(shop.id)).length,
+        activeUsersCount: users.filter((user) => String(user.shopId) === String(shop.id) && user.active !== false).length,
+      })),
+      users: users.map((user) => serializeAdminUser(user, shopNames.get(String(user.shopId)) || 'Unknown shop')),
+    });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+apiRouter.put('/admin/shops/:shopId/invoice-design', async (req, res, next) => {
+  try {
+    const shop = await db.Shop.findById(req.params.shopId);
+    if (!shop || shop.platformAdminWorkspace === true) {
+      return res.status(404).json({ error: 'Shop not found.' });
+    }
+    const design = req.body?.invoiceDesign || {};
+    const themes = new Set(['blue', 'teal', 'violet', 'graphite']);
+    const logo = design.removeLogo ? '' : (design.logo === undefined ? shop.invoiceDesign?.logo || '' : String(design.logo));
+    if (logo.length > 350_000 || (logo && !/^data:image\/(png|jpeg|webp);base64,/i.test(logo))) {
+      return res.status(400).json({ error: 'Invoice logo must be a PNG, JPEG, or WebP image smaller than 250 KB.' });
+    }
+    const theme = themes.has(design.theme) ? design.theme : (shop.invoiceDesign?.theme || 'blue');
+    const accentColor = /^#[0-9a-f]{6}$/i.test(String(design.accentColor || ''))
+      ? String(design.accentColor)
+      : (shop.invoiceDesign?.accentColor || '#0757a6');
+    const updated = await db.Shop.updateOne({ _id: shop.id }, {
+      invoiceDesign: { theme, accentColor, logo },
+    });
+    await logAudit(shop.id, req.user, 'invoice_design_updated', 'Shop', shop.id, `Updated invoice design for ${shop.name}`);
+    return res.json({ invoiceDesign: updated.invoiceDesign });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+apiRouter.post('/admin/shops', async (req, res, next) => {
+  try {
+    const { shopName, ownerName, email, password, phone = '', whatsapp = '', city = '', address = '' } = req.body || {};
+    const cleanShop = String(shopName || '').trim();
+    const cleanOwner = String(ownerName || '').trim();
+    const cleanEmail = String(email || '').trim().toLowerCase();
+    const cleanPassword = String(password || '');
+    if (!cleanShop || !cleanOwner || !cleanEmail || cleanPassword.length < 12) {
+      return res.status(400).json({ error: 'Shop name, owner name, email, and a password of at least 12 characters are required.' });
+    }
+    if (await db.User.findOne({ email: cleanEmail })) {
+      return res.status(409).json({ error: 'This email already has an account. Use another email.' });
+    }
+
+    const created = await runInTransaction(async () => {
+      const shop = await db.Shop.create({
+        name: cleanShop,
+        phone: String(phone).trim(),
+        whatsapp: String(whatsapp || phone).trim(),
+        city: String(city).trim(),
+        address: String(address).trim(),
+        receiptFooter: `Thank you for shopping at ${cleanShop}! Warranty claims require original invoice.`,
+        invoicePrefix: 'INV',
+        currency: 'PKR',
+        openingCash: 0,
+      });
+      const owner = await db.User.create({
+        shopId: shop.id,
+        name: cleanOwner,
+        email: cleanEmail,
+        passwordHash: await hashPassword(cleanPassword),
+        role: 'owner',
+        active: true,
+      });
+      await logAudit(shop.id, req.user, 'platform_shop_created', 'Shop', shop.id, `Platform admin created shop "${cleanShop}" with owner ${cleanEmail}`);
+      return { shop, owner };
+    });
+    return res.status(201).json({
+      shop: { id: created.shop.id, name: created.shop.name, city: created.shop.city },
+      owner: serializeAdminUser(created.owner, created.shop.name),
+    });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+apiRouter.post('/admin/users', async (req, res, next) => {
+  try {
+    const { shopId, name, email, password, role = 'shop_account' } = req.body || {};
+    const cleanShopId = String(shopId || '').trim();
+    const cleanName = String(name || '').trim();
+    const cleanEmail = String(email || '').trim().toLowerCase();
+    const cleanPassword = String(password || '');
+    const allowedRoles = ['owner', 'shop_account', 'overview_viewer'];
+    if (!cleanShopId || !cleanName || !cleanEmail || !allowedRoles.includes(role) || cleanPassword.length < 12) {
+      return res.status(400).json({ error: 'Choose a shop, name, email, valid role, and a password of at least 12 characters.' });
+    }
+    const shop = await db.Shop.findById(cleanShopId);
+    if (!shop || shop.platformAdminWorkspace === true) return res.status(404).json({ error: 'Shop not found.' });
+    if (await db.User.findOne({ email: cleanEmail })) return res.status(409).json({ error: 'This email already has an account. Use another email.' });
+
+    if (role === 'overview_viewer') {
+      const viewers = await db.User.find({ shopId: cleanShopId, role: 'overview_viewer' });
+      if (viewers.filter((viewer) => viewer.active !== false).length >= 2) {
+        return res.status(400).json({ error: 'This shop already has two active Overview-only accounts.' });
+      }
+    }
+
+    const created = await db.User.create({
+      shopId: cleanShopId,
+      name: cleanName,
+      email: cleanEmail,
+      passwordHash: await hashPassword(cleanPassword),
+      role,
+      active: true,
+    });
+    await logAudit(cleanShopId, req.user, 'platform_user_created', 'User', created.id, `Platform admin created ${role} account for ${cleanEmail}`);
+    return res.status(201).json({ user: serializeAdminUser(created, shop.name) });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+apiRouter.put('/admin/users/:id', async (req, res, next) => {
+  try {
+    const target = await db.User.findById(req.params.id);
+    if (!target || target.role === 'super_admin') return res.status(404).json({ error: 'Managed shop user not found.' });
+    const shop = await db.Shop.findById(target.shopId);
+    if (!shop || shop.platformAdminWorkspace === true) return res.status(404).json({ error: 'Shop not found.' });
+
+    const { name, email, role, active, newPassword } = req.body || {};
+    const patch = {};
+    if (name !== undefined) {
+      const cleanName = String(name).trim();
+      if (!cleanName) return res.status(400).json({ error: 'User name cannot be empty.' });
+      patch.name = cleanName;
+    }
+    if (email !== undefined) {
+      const cleanEmail = String(email).trim().toLowerCase();
+      if (!cleanEmail) return res.status(400).json({ error: 'User email cannot be empty.' });
+      const existing = await db.User.findOne({ email: cleanEmail });
+      if (existing && existing.id !== target.id) return res.status(409).json({ error: 'This email already has an account.' });
+      patch.email = cleanEmail;
+    }
+    if (role !== undefined) {
+      if (!['owner', 'shop_account', 'overview_viewer'].includes(role)) return res.status(400).json({ error: 'Unsupported shop role.' });
+      patch.role = role;
+    }
+    if (active !== undefined) patch.active = Boolean(active);
+    if (newPassword !== undefined && String(newPassword) !== '') {
+      if (String(newPassword).length < 12) return res.status(400).json({ error: 'New password must be at least 12 characters.' });
+      patch.passwordHash = await hashPassword(String(newPassword));
+      patch.resetCodeHash = null;
+      patch.resetExpiresAt = null;
+      patch.resetAttempts = 0;
+      patch.resetLockedUntil = null;
+    }
+
+    const willBeActiveOwner = (patch.active ?? target.active !== false) && (patch.role ?? target.role) === 'owner';
+    const wasActiveOwner = target.role === 'owner' && target.active !== false;
+    if (wasActiveOwner && !willBeActiveOwner) {
+      const owners = await db.User.find({ shopId: target.shopId, role: 'owner' });
+      if (owners.filter((owner) => owner.id !== target.id && owner.active !== false).length === 0) {
+        return res.status(400).json({ error: 'Add or activate another shop owner before disabling or changing this last active owner.' });
+      }
+    }
+    if ((patch.role ?? target.role) === 'overview_viewer' && (patch.active ?? target.active !== false)) {
+      const viewers = await db.User.find({ shopId: target.shopId, role: 'overview_viewer' });
+      if (viewers.filter((viewer) => viewer.id !== target.id && viewer.active !== false).length >= 2) {
+        return res.status(400).json({ error: 'This shop already has two active Overview-only accounts.' });
+      }
+    }
+
+    const updated = await db.User.updateOne({ _id: target.id }, patch);
+    await logAudit(target.shopId, req.user, 'platform_user_updated', 'User', target.id, `Platform admin updated user ${updated.email} (${updated.active ? 'active' : 'deactivated'})`);
+    return res.json({ user: serializeAdminUser(updated, shop.name) });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+apiRouter.use((req, res, next) => {
+  if (req.user?.role === 'super_admin') {
+    return res.status(403).json({ error: 'Super Admin accounts can only use platform administration routes.' });
+  }
+  return next();
+});
+
 // Overview viewers receive aggregate, read-only shop metrics and cannot use any other API.
 apiRouter.get('/overview', async (req, res, next) => {
   try {
@@ -487,7 +708,7 @@ async function buildShopBootstrap(shopId, currentUser) {
   }));
 
   return {
-    shop: shop ? { ...shop, whatsappAutomationConfigured: isWhatsAppAutomationConfigured() } : shop,
+    shop,
     user: currentUser,
     users,
     products,
@@ -533,10 +754,7 @@ apiRouter.get('/settings', async (req, res) => {
     active: u.active !== false,
     lastLoginAt: u.lastLoginAt,
   }));
-  return res.json({
-    shop: shop ? { ...shop, whatsappAutomationConfigured: isWhatsAppAutomationConfigured() } : shop,
-    users,
-  });
+  return res.json({ shop, users });
 });
 
 apiRouter.put('/settings', requireOwner, async (req, res) => {
@@ -552,28 +770,11 @@ apiRouter.put('/settings', requireOwner, async (req, res) => {
       openingCash,
       taxNumber,
       currency,
-      automation,
     } = req.body || {};
 
     const cleanName = String(name || '').trim();
     if (!cleanName) {
       return res.status(400).json({ error: 'Shop name cannot be empty.' });
-    }
-
-    const previousAutomation = req.shop.automation || {};
-    const nextAutomation = {
-      installmentRemindersEnabled: Boolean(
-        automation?.installmentRemindersEnabled ?? previousAutomation.installmentRemindersEnabled
-      ),
-      lowStockAlertsEnabled: Boolean(
-        automation?.lowStockAlertsEnabled ?? previousAutomation.lowStockAlertsEnabled
-      ),
-      lowStockRecipients: Array.isArray(automation?.lowStockRecipients)
-        ? [...new Set(automation.lowStockRecipients.map(normalizeWhatsAppNumber).filter(Boolean))].slice(0, 2)
-        : [...new Set((previousAutomation.lowStockRecipients || []).map(normalizeWhatsAppNumber).filter(Boolean))].slice(0, 2),
-    };
-    if (nextAutomation.lowStockAlertsEnabled && nextAutomation.lowStockRecipients.length !== 2) {
-      return res.status(400).json({ error: 'Enter two valid WhatsApp numbers before enabling low-stock alerts.' });
     }
 
     const patch = {
@@ -587,7 +788,6 @@ apiRouter.put('/settings', requireOwner, async (req, res) => {
       openingCash: openingCash !== undefined ? num(openingCash) : num(req.shop.openingCash),
       taxNumber: String(taxNumber ?? req.shop.taxNumber ?? '').trim(),
       currency: String(currency || 'PKR').trim(),
-      automation: nextAutomation,
     };
 
     const updated = await db.Shop.updateOne({ _id: req.shopId }, patch);
@@ -1259,7 +1459,6 @@ apiRouter.post('/sales', async (req, res) => {
               months: totals.months,
               monthlyAmount: totals.monthly,
               installmentPercent: totals.installmentPercent,
-              paymentMethod: String(salePayment?.method || 'cash'),
               startDate: todayDate,
               nextDueDate: pakistanDateString(nextDue),
             },
@@ -1487,7 +1686,6 @@ apiRouter.post('/installments/plans', async (req, res) => {
             months: durMonths,
             monthlyAmount: monthly,
             installmentPercent: 0,
-            paymentMethod: 'cash',
             startDate: start,
             nextDueDate: pakistanDateString(nextDue),
           },
@@ -1544,35 +1742,6 @@ apiRouter.post('/installments/plans', async (req, res) => {
   }
 });
 
-apiRouter.patch('/installments/:planId/reminders', requireOwner, async (req, res) => {
-  try {
-    const { enabled, customerConsent } = req.body || {};
-    const shouldEnable = enabled === true;
-    if (shouldEnable && customerConsent !== true) {
-      return res.status(400).json({ error: 'Customer consent is required before enabling WhatsApp reminders.' });
-    }
-    const plan = await db.InstallmentPlan.findOne({ _id: req.params.planId, shopId: req.shopId });
-    if (!plan) return res.status(404).json({ error: 'Installment plan not found.' });
-    if (shouldEnable && Number(plan.balance || 0) <= 0) {
-      return res.status(400).json({ error: 'This plan is already paid in full.' });
-    }
-    if (shouldEnable && !normalizeWhatsAppNumber(plan.whatsapp || plan.phone)) {
-      return res.status(400).json({ error: 'Add a valid customer WhatsApp number before enabling reminders.' });
-    }
-
-    const updated = await db.InstallmentPlan.updateOne(
-      { _id: plan.id, shopId: req.shopId },
-      {
-        whatsappReminderEnabled: shouldEnable,
-        whatsappReminderConsent: shouldEnable && customerConsent === true,
-      }
-    );
-    return res.json({ plan: updated });
-  } catch (err) {
-    return res.status(500).json({ error: 'Could not update installment reminder settings.' });
-  }
-});
-
 apiRouter.post('/installments/:planId/pay', async (req, res) => {
   try {
     const { amount, method = 'cash', bankName = '', reference = '', note = '', idempotencyKey } = req.body || {};
@@ -1617,7 +1786,6 @@ apiRouter.post('/installments/:planId/pay', async (req, res) => {
           balance: calc.newBalance,
           status: calc.newStatus,
           nextDueDate: calc.newStatus === 'Paid' ? 'Completed' : pakistanDateString(nextDue),
-          whatsappReminderEnabled: calc.newBalance > 0 && plan.whatsappReminderEnabled === true,
         }
       );
 
@@ -1711,45 +1879,45 @@ apiRouter.post('/ocr/invoice', async (req, res) => {
     const hasRealKey = apiKey && apiKey !== 'MY_GEMINI_API_KEY' && dataUrl && dataUrl.startsWith('data:image/');
 
     if (hasRealKey) {
-      try {
-        const ai = new GoogleGenAI({ apiKey });
-        const base64Data = dataUrl.split(',')[1];
-        const response = await ai.models.generateContent({
-          model: process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite',
-          config: {
-            responseMimeType: 'application/json',
-            httpOptions: { timeout: 25000, retryOptions: { attempts: 2, initialDelay: 1, maxDelay: 2 } },
-          },
-          contents: [
-            {
-              inlineData: {
-                mimeType: mimeType || 'image/jpeg',
-                data: base64Data,
-              },
+      const ai = new GoogleGenAI({ apiKey });
+      const base64Data = dataUrl.split(',')[1];
+      const configuredModel = String(process.env.GEMINI_MODEL || 'gemini-3.8-flash').trim();
+      const models = [...new Set([configuredModel, 'gemini-3.6-flash', 'gemini-3.5-flash-lite'])];
+      let lastError;
+      for (const model of models) {
+        try {
+          const response = await ai.models.generateContent({
+            model,
+            config: {
+              responseMimeType: 'application/json',
+              httpOptions: { timeout: 22000, retryOptions: { attempts: 1 } },
             },
-            {
-              text: INVOICE_OCR_PROMPT,
-            },
-          ],
-        });
-        const text = response.text || '';
-        const jsonMatch = text.match(/\{[\s\S]*\}/);
-        if (jsonMatch) {
-          const parsed = JSON.parse(jsonMatch[0]);
-          const draft = normalizeInvoiceDraft(parsed);
+            contents: [
+              { inlineData: { mimeType: mimeType || 'image/jpeg', data: base64Data } },
+              { text: INVOICE_OCR_PROMPT },
+            ],
+          });
+          const text = response.text || '';
+          const jsonMatch = text.match(/\{[\s\S]*\}/);
+          if (!jsonMatch) throw new Error('OCR returned no structured invoice data.');
+          const draft = normalizeInvoiceDraft(JSON.parse(jsonMatch[0]));
           return res.json({
             ocrStatus: 'extracted',
             limitationNote: ['Invoice draft extracted. Review all fields against the original before confirming.', ...draft.warnings].join(' '),
             draft,
           });
+        } catch (error) {
+          lastError = error;
+          const status = Number(error.status);
+          const retryable = [429, 500, 502, 503, 504].includes(status) || /timeout|deadline|abort|temporar|no structured/i.test(error.message || '');
+          if (!retryable) break;
         }
-      } catch (error) {
-        const status = Number(error.status);
-        ocrFailure = [429, 503, 504].includes(status) || /timeout|deadline|abort/i.test(error.message || '')
-          ? 'Invoice reading timed out or the OCR service is busy. Upload the invoice again to retry; no items were saved.'
-          : 'Automatic invoice reading failed. Upload again to retry or enter the items manually; no items were saved.';
-        // Fall through to safe draft template with transparent explanation
       }
+      const status = Number(lastError?.status);
+      ocrFailure = [429, 500, 502, 503, 504].includes(status) || /timeout|deadline|abort/i.test(lastError?.message || '')
+        ? 'Automatic invoice reading is temporarily busy across available models. Try again shortly; no stock was saved.'
+        : 'Automatic invoice reading could not reliably read this document. Review or enter the items manually; no stock was saved.';
+      // Fall through to safe draft template with transparent explanation.
     }
 
     if (isPdf) {
@@ -2694,6 +2862,64 @@ apiRouter.put('/cheques/:id/status', async (req, res) => {
   }
 });
 
+apiRouter.get('/cash-register', async (req, res) => {
+  const [openSession, sessions, transactions] = await Promise.all([
+    db.CashSession.findOne({ shopId: req.shopId, status: 'open' }),
+    db.CashSession.find({ shopId: req.shopId }, { sort: { openedAt: -1 }, limit: 10 }),
+    db.FinancialTransaction.find({ shopId: req.shopId }),
+  ]);
+  const current = openSession
+    ? { ...openSession, ...calculateCashSessionTotals(transactions, openSession) }
+    : null;
+  return res.json({ current, sessions });
+});
+
+apiRouter.post('/cash-register/open', async (req, res) => {
+  const openingAmount = Number(req.body?.openingAmount);
+  if (!Number.isFinite(openingAmount) || openingAmount < 0) {
+    return res.status(400).json({ error: 'Enter a valid opening cash amount.' });
+  }
+  const existing = await db.CashSession.findOne({ shopId: req.shopId, status: 'open' });
+  if (existing) return res.status(409).json({ error: 'A cash register session is already open. Close it before opening another.' });
+  const session = await db.CashSession.create({
+    shopId: req.shopId,
+    status: 'open',
+    openedAt: new Date().toISOString(),
+    openedBy: req.user.name,
+    openingAmount,
+    openingNote: String(req.body?.note || '').trim(),
+  });
+  await logAudit(req.shopId, req.user, 'cash_session_opened', 'CashSession', session.id,
+    `Cash register opened with Rs. ${openingAmount.toLocaleString()}`);
+  return res.status(201).json({ session });
+});
+
+apiRouter.post('/cash-register/close', async (req, res) => {
+  const actualClosingAmount = Number(req.body?.actualClosingAmount);
+  if (!Number.isFinite(actualClosingAmount) || actualClosingAmount < 0) {
+    return res.status(400).json({ error: 'Enter a valid counted closing cash amount.' });
+  }
+  const session = await db.CashSession.findOne({ shopId: req.shopId, status: 'open' });
+  if (!session) return res.status(409).json({ error: 'There is no open cash register session to close.' });
+  const closedAt = new Date().toISOString();
+  const transactions = await db.FinancialTransaction.find({ shopId: req.shopId });
+  const totals = calculateCashSessionTotals(transactions, session, new Date(closedAt).getTime());
+  const closed = await db.CashSession.updateOne({ _id: session.id, shopId: req.shopId, status: 'open' }, {
+    status: 'closed',
+    closedAt,
+    closedBy: req.user.name,
+    actualClosingAmount,
+    expectedClosingAmount: totals.expectedClosingAmount,
+    difference: actualClosingAmount - totals.expectedClosingAmount,
+    closingNote: String(req.body?.note || '').trim(),
+    cashIn: totals.cashIn,
+    cashOut: totals.cashOut,
+  });
+  await logAudit(req.shopId, req.user, 'cash_session_closed', 'CashSession', closed.id,
+    `Cash register closed; expected Rs. ${totals.expectedClosingAmount.toLocaleString()}, counted Rs. ${actualClosingAmount.toLocaleString()}`);
+  return res.json({ session: closed, totals });
+});
+
 apiRouter.post('/finance/banks', async (req, res) => {
   try {
     const { bankName, accountTitle, accountNumber, openingBalance } = req.body || {};
@@ -2786,3 +3012,4 @@ apiRouter.post('/finance/transactions', async (req, res) => {
     return res.status(err.status || 500).json({ error: err.status ? err.message : 'Failed to record financial transaction.' });
   }
 });
+

@@ -11,6 +11,7 @@ const {
   calculateInstallmentPayment,
   validateStockReceipt,
   calculateShopFinancialSummary,
+  calculateCashSessionTotals,
 } = await import('../utils/calculations.js');
 const { resetInMemoryStateForTests } = await import('../db.js');
 const { createApp } = await import('../index.js');
@@ -43,6 +44,27 @@ test('calculateSaleTotals handles partial cash payments and unpaid udhaar accura
   assert.equal(partialCash.cashCollected, 50000);
   assert.equal(partialCash.balance, 25000);
   assert.equal(partialCash.grossMargin, 4000); // 75,000 - 71,000
+});
+
+test('cash sale paid and due totals stay linked when the full invoice amount is entered', () => {
+  const totals = calculateSaleTotals({
+    items: [{ id: 'p1', name: 'Fan 202', qty: 2, price: 5000, cost: 4000 }],
+    saleType: 'cash', paymentMethod: 'cash', cashAmount: 10000,
+  });
+  assert.equal(totals.final, 10000);
+  assert.equal(totals.paid, 10000);
+  assert.equal(totals.balance, 0);
+});
+
+test('cash register closing reconciles opening cash with cash-only movements in the session', () => {
+  const openedAt = '2026-10-29T09:00:00.000Z';
+  const totals = calculateCashSessionTotals([
+    { method: 'cash', direction: 'in', amount: 12000, createdAt: '2026-10-29T10:00:00.000Z' },
+    { method: 'cash', direction: 'out', amount: 2500, createdAt: '2026-10-29T11:00:00.000Z' },
+    { method: 'bank', direction: 'in', amount: 9000, createdAt: '2026-10-29T11:30:00.000Z' },
+    { method: 'cash', direction: 'in', amount: 5000, createdAt: '2026-10-29T08:00:00.000Z' },
+  ], { openedAt, openingAmount: 3000 }, new Date('2026-10-29T12:00:00.000Z').getTime());
+  assert.deepEqual(totals, { cashIn: 12000, cashOut: 2500, expectedClosingAmount: 12500 });
 });
 
 test('calculateSaleTotals computes installment plan surcharge, advance, balance, and monthly payment', () => {
@@ -303,20 +325,6 @@ test('Multi-tenant isolation, RBAC permissions, sales, returns, installments, an
     assert.equal(ownerSettingsUpdate.status, 200);
     assert.equal(ownerSettingsUpdate.data.shop.name, 'First Flagship Store');
     assert.equal(ownerSettingsUpdate.data.shop.whatsapp, '+923009998877');
-    const invalidAutomationSettings = await api('/settings', {
-      method: 'PUT', token: ownerToken,
-      body: { name: 'First Flagship Store', automation: { lowStockAlertsEnabled: true, lowStockRecipients: ['03001234567', 'bad'] } },
-    });
-    assert.equal(invalidAutomationSettings.status, 400, 'low-stock automation requires two valid WhatsApp numbers');
-    const automationSettings = await api('/settings', {
-      method: 'PUT', token: ownerToken,
-      body: { name: 'First Flagship Store', automation: {
-        installmentRemindersEnabled: true,
-        lowStockAlertsEnabled: true,
-        lowStockRecipients: ['03001234567', '+923007654321'],
-      } },
-    });
-    assert.deepEqual(automationSettings.data.shop.automation.lowStockRecipients, ['923001234567', '923007654321']);
 
     const productRes = await api('/products', {
       method: 'POST', token: ownerToken,
@@ -575,6 +583,18 @@ test('Urdu invoice drafts separate totals and flag unclear handwriting without i
  assert.ok(!draft.warnings.join(' ').includes('retail prices'));
  const mismatch=normalizeInvoiceDraft({items:[{name:'Test',qty:2,cost:100,price:null,lineTotal:300}]});
  assert.match(mismatch.warnings.join(' '),/does not match/);
+ const modelDraft=normalizeInvoiceDraft({items:[
+  {name:'Ceiling fan',model:'202',code:'202',codeType:'model',qty:3,cost:13800,lineTotal:41400},
+  {name:'Fan model 550',model:'550',code:'550',codeType:'model',qty:1,cost:14200,lineTotal:14200},
+  {name:'Fan',code:'123456',codeType:'hsn',qty:1,cost:100,lineTotal:100},
+ ]});
+ assert.match(modelDraft.items[0].name,/Model 202/);
+ assert.equal(modelDraft.items[0].code,'202');
+ assert.equal(modelDraft.items[0].codeType,'model');
+ assert.equal(modelDraft.items[1].name,'Fan model 550', 'model should not be duplicated in item names');
+ assert.equal(modelDraft.items[2].code,'', 'HSN values must still be discarded');
+ const uncertainModel=normalizeInvoiceDraft({items:[{name:'Fan',model:'',qty:1,cost:100,lineTotal:100,confidence:{name:'high',model:'low',qty:'high',cost:'high',lineTotal:'high'}}]});
+ assert.match(uncertainModel.items[0].reviewNote,/verify unclear model/);
 });
 
 test('Finance and expense edits keep invoice, bank, and ledger balances in sync', async () => {
@@ -728,19 +748,6 @@ test('Installment sales save customer and guarantor photos inside one details ob
     assert.equal(storedPlan.installmentDetails.guarantor.photoDataUrl, guarantorPhoto);
     assert.equal(storedPlan.installmentDetails.plan.months, 10);
     assert.equal(storedPlan.installmentDetails.customer.cnic, '12345-1234567-1');
-    const missingConsent = await api(`/installments/${storedPlan.id}/reminders`, {
-      method: 'PATCH', token, body: { enabled: true, customerConsent: false },
-    });
-    assert.equal(missingConsent.status, 400);
-    const enabledReminder = await api(`/installments/${storedPlan.id}/reminders`, {
-      method: 'PATCH', token, body: { enabled: true, customerConsent: true },
-    });
-    assert.equal(enabledReminder.status, 200);
-    assert.equal(enabledReminder.data.plan.whatsappReminderEnabled, true);
-    const disabledReminder = await api(`/installments/${storedPlan.id}/reminders`, {
-      method: 'PATCH', token, body: { enabled: false, customerConsent: false },
-    });
-    assert.equal(disabledReminder.data.plan.whatsappReminderEnabled, false);
 
     const invalidPhotoSale = await api('/sales', { token, body: {
       customerId: 'new', saleType: 'installment', customerInfo: { name: 'Invalid Photo', customerPhoto: 'data:application/pdf;base64,AA==' },
@@ -797,72 +804,85 @@ test('Shop accounts require eight-character passwords and reset codes lock after
   }
 });
 
-test('WhatsApp automations deduplicate monthly reminders and rearm stock alerts after restocking', async () => {
-  const { db, resetInMemoryStateForTests } = await import('../db.js');
-  const { runAutomationCycle } = await import('../services/automationScheduler.js');
-  const envKeys = [
-    'WHATSAPP_ACCESS_TOKEN', 'WHATSAPP_PHONE_NUMBER_ID', 'WHATSAPP_GRAPH_API_VERSION',
-    'WHATSAPP_TEMPLATE_LANGUAGE', 'WHATSAPP_INSTALLMENT_TEMPLATE', 'WHATSAPP_LOW_STOCK_TEMPLATE',
-  ];
-  const previousEnv = Object.fromEntries(envKeys.map((key) => [key, process.env[key]]));
-  const originalFetch = globalThis.fetch;
-  const sent = [];
-  envKeys.forEach((key) => delete process.env[key]);
-  process.env.WHATSAPP_ACCESS_TOKEN = 'test-token';
-  process.env.WHATSAPP_PHONE_NUMBER_ID = 'test-phone-id';
-  globalThis.fetch = async (url, options) => {
-    sent.push({ url, body: JSON.parse(options.body) });
-    return { ok: true, status: 200, json: async () => ({ messages: [{ id: `test-${sent.length}` }] }) };
+test('Super Admin can provision isolated shops and manage users without leaking tenant data', async () => {
+  resetInMemoryStateForTests();
+  const { db } = await import('../db.js');
+  const { hashPassword, signAuthToken } = await import('../middleware/auth.js');
+  const platformShop = await db.Shop.create({ name: 'Platform Administration', platformAdminWorkspace: true });
+  const admin = await db.User.create({
+    shopId: platformShop.id,
+    name: 'Platform Admin',
+    email: 'platform-admin@test.invalid',
+    passwordHash: await hashPassword('PlatformPassword123!'),
+    role: 'super_admin',
+    active: true,
+  });
+  const adminToken = signAuthToken(admin);
+  const server = await new Promise((resolve) => {
+    const listener = createApp().listen(0, '127.0.0.1', () => resolve(listener));
+  });
+  const api = async (path, { method = 'GET', token = '', body } = {}) => {
+    const response = await fetch(`http://127.0.0.1:${server.address().port}/api${path}`, {
+      method,
+      headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    return { status: response.status, data: await response.json() };
   };
 
   try {
-    resetInMemoryStateForTests();
-    const shop = await db.Shop.create({
-      name: 'Automation Test Shop',
-      automation: {
-        installmentRemindersEnabled: true,
-        lowStockAlertsEnabled: true,
-        lowStockRecipients: ['03001234567', '+923007654321'],
-      },
-    });
-    const product = await db.Product.create({
-      shopId: shop.id, name: 'Test Fan', code: 'FAN-01', stock: 2, reorderThreshold: 5,
-    });
-    const plan = await db.InstallmentPlan.create({
-      shopId: shop.id, planNo: 'PLAN-TEST-1', customerName: 'Test Customer',
-      whatsapp: '03007654321', totalAmount: 12000, paid: 2000, balance: 10000,
-      monthlyAmount: 1000, nextDueDate: '2026-10-01',
-      whatsappReminderEnabled: true, whatsappReminderConsent: true,
-    });
+    process.env.ALLOW_PUBLIC_SHOP_REGISTRATION = 'true';
+    const existingShop = await api('/auth/register-shop', { method: 'POST', body: {
+      shopName: 'Existing Shop', ownerName: 'Existing Owner', email: 'existing-owner@test.invalid', password: 'ExistingOwner123',
+    } });
+    assert.equal(existingShop.status, 201);
+    assert.equal((await api('/admin/summary', { token: existingShop.data.token })).status, 403, 'Shop owners cannot access the platform dashboard API');
 
-    await runAutomationCycle(new Date('2026-10-23T06:00:00.000Z'));
-    assert.equal(sent.length, 3, 'one customer reminder and two recipient stock alerts are sent');
-    assert.deepEqual(
-      sent.slice(0, 2).map((message) => message.body.to),
-      ['923001234567', '923007654321']
-    );
-    assert.equal(sent[0].body.template.name, 'low_stock_alert');
-    assert.equal(sent[2].body.type, 'template');
-    assert.equal(sent[2].body.template.name, 'installment_payment_reminder');
-    assert.equal(sent[2].body.to, '923007654321');
+    const summary = await api('/admin/summary', { token: adminToken });
+    assert.equal(summary.status, 200);
+    assert.equal(summary.data.shops.length, 1);
+    assert.equal(summary.data.shops[0].name, 'Existing Shop');
+    assert.equal(summary.data.users[0].passwordHash, undefined);
 
-    await runAutomationCycle(new Date('2026-10-23T06:10:00.000Z'));
-    assert.equal(sent.length, 3, 'the same month and low-stock period do not send duplicates');
+    const createdShop = await api('/admin/shops', { method: 'POST', token: adminToken, body: {
+      shopName: 'Rahimabad Electronics', ownerName: 'Rahimabad Owner', email: 'rahimabad-owner@test.invalid', password: 'RahimabadOwner123', city: 'Rahimabad',
+    } });
+    assert.equal(createdShop.status, 201, createdShop.data.error);
+    assert.equal(createdShop.data.owner.role, 'owner');
+    const designUpdate = await api(`/admin/shops/${createdShop.data.shop.id}/invoice-design`, { method: 'PUT', token: adminToken, body: {
+      invoiceDesign: { theme: 'teal', accentColor: '#0f766e' },
+    } });
+    assert.equal(designUpdate.status, 200, designUpdate.data.error);
+    assert.equal(designUpdate.data.invoiceDesign.theme, 'teal');
+    const designs = await api('/admin/summary', { token: adminToken });
+    assert.equal(designs.data.shops.find((shop) => shop.id === createdShop.data.shop.id).invoiceDesign.theme, 'teal');
+    assert.equal(designs.data.shops.find((shop) => shop.id === existingShop.data.shop.id).invoiceDesign.theme, 'blue', 'another shop keeps its own invoice theme');
+    const ownerLogin = await api('/auth/login', { method: 'POST', body: { email: 'rahimabad-owner@test.invalid', password: 'RahimabadOwner123' } });
+    assert.equal(ownerLogin.status, 200);
+    assert.equal(ownerLogin.data.shop.name, 'Rahimabad Electronics');
+    const ownerDesignAttempt = await api('/settings', { method: 'PUT', token: ownerLogin.data.token, body: {
+      name: 'Rahimabad Electronics',
+      invoiceDesign: { theme: 'violet', accentColor: '#6d3fb3', logo: '' },
+    } });
+    assert.equal(ownerDesignAttempt.status, 200, ownerDesignAttempt.data.error);
+    assert.equal(ownerDesignAttempt.data.shop.invoiceDesign.theme, 'teal', 'shop owners cannot override the Super Admin invoice design');
+    assert.equal(ownerDesignAttempt.data.shop.invoiceDesign.accentColor, '#0f766e');
 
-    await db.Product.updateOne({ _id: product.id, shopId: shop.id }, { stock: 6 });
-    await runAutomationCycle(new Date('2026-10-23T06:15:00.000Z'));
-    await db.Product.updateOne({ _id: product.id, shopId: shop.id }, { stock: 4 });
-    await runAutomationCycle(new Date('2026-10-23T06:20:00.000Z'));
-    assert.equal(sent.length, 5, 'restocking above threshold rearms both recipient alerts');
+    const viewer = await api('/admin/users', { method: 'POST', token: adminToken, body: {
+      shopId: createdShop.data.shop.id, name: 'Read Only', email: 'read-only@test.invalid', password: 'ReadOnlyPass123', role: 'overview_viewer',
+    } });
+    assert.equal(viewer.status, 201, viewer.data.error);
+    assert.equal(viewer.data.user.shopId, createdShop.data.shop.id);
+    assert.equal(viewer.data.user.passwordHash, undefined);
 
-    await runAutomationCycle(new Date('2026-11-23T06:00:00.000Z'));
-    assert.equal(sent.length, 6, 'the unpaid plan gets one reminder in the next due month');
-    assert.equal((await db.InstallmentPlan.findById(plan.id)).lastWhatsAppReminderMonth, '2026-11');
+    const disabled = await api(`/admin/users/${viewer.data.user.id}`, { method: 'PUT', token: adminToken, body: { active: false } });
+    assert.equal(disabled.status, 200);
+    assert.equal(disabled.data.user.active, false);
+    const deniedLogin = await api('/auth/login', { method: 'POST', body: { email: 'read-only@test.invalid', password: 'ReadOnlyPass123' } });
+    assert.equal(deniedLogin.status, 403, 'Disabled platform-managed users cannot sign in');
+    assert.equal((await api('/bootstrap', { token: adminToken })).status, 403, 'Super Admin cannot enter tenant workspace APIs');
   } finally {
-    globalThis.fetch = originalFetch;
-    for (const key of envKeys) {
-      if (previousEnv[key] === undefined) delete process.env[key];
-      else process.env[key] = previousEnv[key];
-    }
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
   }
 });

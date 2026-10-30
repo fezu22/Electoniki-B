@@ -5,6 +5,7 @@ const { Schema } = mongoose;
 const shopSchema = new Schema(
   {
     name: { type: String, required: true, trim: true },
+    platformAdminWorkspace: { type: Boolean, default: false },
     whatsapp: { type: String, default: '', trim: true },
     phone: { type: String, default: '', trim: true },
     address: { type: String, default: '', trim: true },
@@ -14,17 +15,14 @@ const shopSchema = new Schema(
       default: 'Thank you for shopping with us! Warranty claims require original invoice.',
     },
     invoicePrefix: { type: String, default: 'INV', trim: true },
+    invoiceDesign: {
+      theme: { type: String, enum: ['blue', 'teal', 'violet', 'graphite'], default: 'blue' },
+      accentColor: { type: String, default: '#0757a6' },
+      logo: { type: String, default: '' },
+    },
     currency: { type: String, default: 'PKR' },
     openingCash: { type: Number, default: 0 },
     taxNumber: { type: String, default: '' },
-    automation: {
-      type: Schema.Types.Mixed,
-      default: () => ({
-        installmentRemindersEnabled: false,
-        lowStockAlertsEnabled: false,
-        lowStockRecipients: [],
-      }),
-    },
   },
   { timestamps: true }
 );
@@ -35,7 +33,7 @@ const userSchema = new Schema(
     name: { type: String, required: true, trim: true },
     email: { type: String, required: true, lowercase: true, trim: true },
     passwordHash: { type: String, required: true },
-    role: { type: String, enum: ['owner', 'shop_account', 'overview_viewer'], default: 'shop_account' },
+    role: { type: String, enum: ['super_admin', 'owner', 'shop_account', 'overview_viewer'], default: 'shop_account' },
     active: { type: Boolean, default: true },
     resetCodeHash: { type: String, default: null },
     resetExpiresAt: { type: Date, default: null },
@@ -60,7 +58,6 @@ const productSchema = new Schema(
     price: { type: Number, required: true, min: 0 },
     stock: { type: Number, default: 0, min: 0 },
     reorderThreshold: { type: Number, default: 5, min: 0 },
-    lowStockNotifiedRecipients: { type: [String], default: [] },
     active: { type: Boolean, default: true },
   },
   { timestamps: true }
@@ -186,9 +183,6 @@ const installmentPlanSchema = new Schema(
     installmentPercent: { type: Number, default: 0 },
     startDate: { type: String, default: '' },
     nextDueDate: { type: String, default: '' },
-    whatsappReminderEnabled: { type: Boolean, default: false },
-    whatsappReminderConsent: { type: Boolean, default: false },
-    lastWhatsAppReminderMonth: { type: String, default: '' },
     status: { type: String, default: 'Active' },
   },
   { timestamps: true }
@@ -392,6 +386,27 @@ const heldOrderSchema = new Schema(
 );
 heldOrderSchema.index({ shopId: 1, status: 1 });
 
+const cashSessionSchema = new Schema(
+  {
+    shopId: { type: String, required: true },
+    status: { type: String, enum: ['open', 'closed'], default: 'open', index: true },
+    openedAt: { type: String, required: true },
+    openedBy: { type: String, default: '' },
+    openingAmount: { type: Number, required: true, min: 0 },
+    openingNote: { type: String, default: '' },
+    closedAt: { type: String, default: '' },
+    closedBy: { type: String, default: '' },
+    expectedClosingAmount: { type: Number, default: 0 },
+    actualClosingAmount: { type: Number, default: 0 },
+    difference: { type: Number, default: 0 },
+    closingNote: { type: String, default: '' },
+    cashIn: { type: Number, default: 0 },
+    cashOut: { type: Number, default: 0 },
+  },
+  { timestamps: true }
+);
+cashSessionSchema.index({ shopId: 1 }, { unique: true, partialFilterExpression: { status: 'open' } });
+
 const auditEventSchema = new Schema(
   {
     shopId: { type: String, required: true, index: true },
@@ -425,5 +440,6 @@ export const MongooseModels = {
   Cheque: mongoose.models.Cheque || mongoose.model('Cheque', chequeSchema),
   CustomerReturn: mongoose.models.CustomerReturn || mongoose.model('CustomerReturn', customerReturnSchema),
   HeldOrder: mongoose.models.HeldOrder || mongoose.model('HeldOrder', heldOrderSchema),
+  CashSession: mongoose.models.CashSession || mongoose.model('CashSession', cashSessionSchema),
   AuditEvent: mongoose.models.AuditEvent || mongoose.model('AuditEvent', auditEventSchema),
 };

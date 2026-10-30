@@ -89,7 +89,7 @@ export async function requireAuth(req, res, next) {
 
     // If the client attempted to pass a mismatched shopId in body or query, reject it explicitly
     const clientShopId = req.body?.shopId || req.query?.shopId || req.headers?.['x-shop-id'];
-    if (clientShopId && String(clientShopId) !== String(user.shopId)) {
+    if (user.role !== 'super_admin' && clientShopId && String(clientShopId) !== String(user.shopId)) {
       return res.status(403).json({
         error: 'Tenant isolation violation: cross-shop access is strictly forbidden.',
       });
@@ -106,7 +106,7 @@ export async function requireAuth(req, res, next) {
     req.shopId = String(user.shopId);
 
     // Force-overwrite any body shopId with authenticated shopId
-    if (req.body && typeof req.body === 'object') {
+    if (user.role !== 'super_admin' && req.body && typeof req.body === 'object') {
       req.body.shopId = req.shopId;
     }
 
@@ -124,6 +124,13 @@ export function requireOwner(req, res, next) {
     return res.status(403).json({
       error: 'Owner permission required. Shop Account users cannot perform this action.',
     });
+  }
+  next();
+}
+
+export function requireSuperAdmin(req, res, next) {
+  if (!req.user || req.user.role !== 'super_admin') {
+    return res.status(403).json({ error: 'Platform Super Admin permission required.' });
   }
   next();
 }

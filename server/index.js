@@ -4,9 +4,14 @@ import mongoose from 'mongoose';
 import cookieParser from 'cookie-parser';
 import rateLimit from 'express-rate-limit';
 import path from 'path';
-import { connectDatabase } from './db.js';
+import { fileURLToPath } from 'url';
+import { connectDatabase, db } from './db.js';
 import { apiRouter } from './routes/api.js';
+import { hashPassword } from './middleware/auth.js';
 import { startAutomationScheduler } from './services/automationScheduler.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 export function createApp() {
   const app = express();
@@ -51,15 +56,15 @@ export function createApp() {
 
 export async function startServer() {
   await connectDatabase();
+  await ensurePlatformAdmin();
   startAutomationScheduler();
 
   const app = createApp();
   const port = Number(process.env.PORT || 3000);
   const isProd = process.env.NODE_ENV === 'production';
 
-  const frontendDistDir = (process.env.FRONTEND_DIST_DIR || '').trim();
-  if (isProd && frontendDistDir) {
-    const distPath = path.resolve(frontendDistDir);
+  if (isProd) {
+    const distPath = path.resolve(__dirname, '../../frontend/dist');
     app.use(express.static(distPath));
     app.get('*', (_req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));
@@ -81,6 +86,60 @@ export async function startServer() {
   });
 }
 
+export async function ensurePlatformAdmin() {
+  const email = String(process.env.SUPER_ADMIN_EMAIL || '').trim().toLowerCase();
+  const password = String(process.env.SUPER_ADMIN_PASSWORD || '');
+  const name = String(process.env.SUPER_ADMIN_NAME || '').trim();
+  if (!email && !password && !name) return false;
+  if (!email || !password || !name) {
+    throw new Error('Set SUPER_ADMIN_EMAIL, SUPER_ADMIN_NAME, and SUPER_ADMIN_PASSWORD together in backend/.env.');
+  }
+  if (password.length < 12) {
+    throw new Error('SUPER_ADMIN_PASSWORD must be at least 12 characters long.');
+  }
+
+  let platformShop = (await db.Shop.find({})).find((shop) => shop.platformAdminWorkspace === true);
+  if (!platformShop) {
+    platformShop = await db.Shop.create({
+      name: 'Platform Administration',
+      platformAdminWorkspace: true,
+      receiptFooter: '',
+      invoicePrefix: 'SYS',
+      currency: 'PKR',
+      openingCash: 0,
+    });
+  }
+
+  const passwordHash = await hashPassword(password);
+  const existing = await db.User.findOne({ email });
+  if (existing) {
+    if (existing.role === 'super_admin') return false;
+    if (String(process.env.SUPER_ADMIN_PROMOTE_EXISTING || '').toLowerCase() !== 'true') {
+      throw new Error('SUPER_ADMIN_EMAIL is already assigned to a non-platform user. Set SUPER_ADMIN_PROMOTE_EXISTING=true only if this account should become the platform Super Admin.');
+    }
+    await db.User.updateOne({ _id: existing.id }, {
+      shopId: platformShop.id,
+      name,
+      passwordHash,
+      role: 'super_admin',
+      active: true,
+    });
+    console.info('Existing account promoted to Platform Super Admin.');
+    return true;
+  }
+
+  await db.User.create({
+    shopId: platformShop.id,
+    name,
+    email,
+    passwordHash,
+    role: 'super_admin',
+    active: true,
+  });
+  console.info('Platform Super Admin bootstrap completed.');
+  return true;
+}
+
 // Start server if invoked directly or via server.ts
 if (
   process.argv[1] &&
@@ -92,4 +151,3 @@ if (
     process.exitCode = 1;
   });
 }
-
