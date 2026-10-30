@@ -29,6 +29,7 @@ import {
   calculateShopFinancialSummary,
   calculateCashSessionTotals,
 } from '../utils/calculations.js';
+import { isWhatsAppAutomationConfigured, normalizeWhatsAppNumber } from '../utils/whatsappCloud.js';
 
 export const apiRouter = express.Router();
 
@@ -41,6 +42,24 @@ function isValidDateOnly(value) {
   return /^\d{4}-\d{2}-\d{2}$/.test(String(value || '')) &&
     Number.isFinite(Date.parse(`${value}T00:00:00Z`)) &&
     new Date(`${value}T00:00:00Z`).toISOString().slice(0, 10) === value;
+}
+
+function pakistanPeriodBounds(period, selectedDate) {
+  if (period === 'all') return { fromDate: null, toDateExclusive: null };
+  const today = pakistanDateString();
+  const date = period === 'date' ? String(selectedDate || '') : today;
+  if ((period === 'date' && !isValidDateOnly(date)) || date > today) {
+    const error = new Error('Choose a valid date that is not in the future.');
+    error.status = 400;
+    throw error;
+  }
+  let fromKey = period === 'month' ? `${today.slice(0, 7)}-01` : date;
+  const [year, month, day] = fromKey.split('-').map(Number);
+  const start = Date.UTC(year, month - 1, day) - 5 * 60 * 60 * 1000;
+  const end = period === 'month'
+    ? Date.UTC(year, month, 1) - 5 * 60 * 60 * 1000
+    : start + 24 * 60 * 60 * 1000;
+  return { fromDate: new Date(start).toISOString(), toDateExclusive: new Date(end).toISOString() };
 }
 
 function validateAttachment(dataUrl, allowedTypes = ['image/jpeg', 'image/png', 'image/webp', 'application/pdf']) {
@@ -594,6 +613,7 @@ apiRouter.get('/overview', async (req, res, next) => {
       bills, returns, expenses, products, suppliers, bankAccounts, installmentPayments,
       openingCash: shop?.openingCash || 0,
       supplierPayments: financialTransactions.filter((entry) => entry.type === 'supplier_payment'),
+      financialTransactions,
     });
     return res.json({
       shop: { name: shop?.name || '', currency: shop?.currency || 'PKR' },
@@ -641,7 +661,7 @@ apiRouter.get('/stock-workspace', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-async function buildShopBootstrap(shopId, currentUser) {
+async function buildShopBootstrap(shopId, currentUser, period = 'all', date = '') {
   const [
     shop,
     usersRaw,
@@ -673,7 +693,7 @@ async function buildShopBootstrap(shopId, currentUser) {
     db.StockMovement.find({ shopId }, { sort: { createdAt: -1 }, limit: 100 }),
     db.Expense.find({ shopId }),
     db.BankAccount.find({ shopId }),
-    db.FinancialTransaction.find({ shopId }, { sort: { createdAt: -1 }, limit: 150 }),
+    db.FinancialTransaction.find({ shopId }, { sort: { createdAt: -1 } }),
     db.Cheque.find({ shopId }),
     db.CustomerReturn.find({ shopId }),
     db.HeldOrder.find({ shopId }),
@@ -694,6 +714,8 @@ async function buildShopBootstrap(shopId, currentUser) {
     installmentPayments,
     openingCash: shop?.openingCash || 0,
     supplierPayments,
+    financialTransactions,
+    ...pakistanPeriodBounds(period, date),
   });
 
   const users = usersRaw.map((u) => ({
@@ -708,7 +730,7 @@ async function buildShopBootstrap(shopId, currentUser) {
   }));
 
   return {
-    shop,
+    shop: shop ? { ...(shop.toObject ? shop.toObject() : shop), whatsappAutomationConfigured: isWhatsAppAutomationConfigured() } : shop,
     user: currentUser,
     users,
     products,
@@ -732,9 +754,11 @@ async function buildShopBootstrap(shopId, currentUser) {
 
 apiRouter.get('/bootstrap', async (req, res) => {
   try {
-    const payload = await buildShopBootstrap(req.shopId, req.user);
+    const period = ['all', 'month', 'today', 'date'].includes(String(req.query.period || 'all')) ? String(req.query.period || 'all') : 'all';
+    const payload = await buildShopBootstrap(req.shopId, req.user, period, req.query.date);
     return res.json(payload);
   } catch (err) {
+    if (err.status === 400) return res.status(400).json({ error: err.message });
     return res.status(500).json({ error: 'Failed to load workspace data.' });
   }
 });
@@ -754,7 +778,8 @@ apiRouter.get('/settings', async (req, res) => {
     active: u.active !== false,
     lastLoginAt: u.lastLoginAt,
   }));
-  return res.json({ shop, users });
+  const shopData = shop?.toObject ? shop.toObject() : shop;
+  return res.json({ shop: shopData ? { ...shopData, whatsappAutomationConfigured: isWhatsAppAutomationConfigured() } : shopData, users });
 });
 
 apiRouter.put('/settings', requireOwner, async (req, res) => {
@@ -770,6 +795,7 @@ apiRouter.put('/settings', requireOwner, async (req, res) => {
       openingCash,
       taxNumber,
       currency,
+      automation,
     } = req.body || {};
 
     const cleanName = String(name || '').trim();
@@ -788,6 +814,17 @@ apiRouter.put('/settings', requireOwner, async (req, res) => {
       openingCash: openingCash !== undefined ? num(openingCash) : num(req.shop.openingCash),
       taxNumber: String(taxNumber ?? req.shop.taxNumber ?? '').trim(),
       currency: String(currency || 'PKR').trim(),
+      automation: {
+        installmentRemindersEnabled: automation?.installmentRemindersEnabled === undefined
+          ? Boolean(req.shop.automation?.installmentRemindersEnabled)
+          : Boolean(automation.installmentRemindersEnabled),
+        lowStockAlertsEnabled: automation?.lowStockAlertsEnabled === undefined
+          ? Boolean(req.shop.automation?.lowStockAlertsEnabled)
+          : Boolean(automation.lowStockAlertsEnabled),
+        lowStockRecipients: Array.isArray(automation?.lowStockRecipients)
+          ? automation.lowStockRecipients.slice(0, 2).map((value) => String(value || '').trim())
+          : (req.shop.automation?.lowStockRecipients || []),
+      },
     };
 
     const updated = await db.Shop.updateOne({ _id: req.shopId }, patch);
@@ -800,7 +837,8 @@ apiRouter.put('/settings', requireOwner, async (req, res) => {
       `Updated shop settings (${cleanName}, WhatsApp: ${patch.whatsapp})`
     );
 
-    return res.json({ shop: updated });
+    const shopData = updated?.toObject ? updated.toObject() : updated;
+    return res.json({ shop: shopData ? { ...shopData, whatsappAutomationConfigured: isWhatsAppAutomationConfigured() } : shopData });
   } catch (err) {
     return res.status(500).json({ error: 'Failed to update shop settings.' });
   }
@@ -1184,6 +1222,7 @@ apiRouter.post('/sales', async (req, res) => {
       idempotencyKey,
       customerId,
       customerInfo,
+      padNo = '',
       saleType = 'cash',
       items = [],
       billDiscount = 0,
@@ -1391,6 +1430,7 @@ apiRouter.post('/sales', async (req, res) => {
       const sale = await db.Sale.create({
         shopId: req.shopId,
         invoiceNo,
+        padNo: String(padNo || '').trim().slice(0, 40),
         idempotencyKey: String(idempotencyKey || ''),
         customerId: resolvedCustomer?.id || 'walkin',
         customer: custName,
@@ -1502,9 +1542,9 @@ apiRouter.post('/sales', async (req, res) => {
 
       if (totals.bankCollected > 0) {
         const bankName = String(salePayment.bankName || '').trim();
-        const bankAcc = await db.BankAccount.findOne({ shopId: req.shopId, bankName });
-        if (!bankAcc || bankAcc.active === false) { const error = new Error('Select an active bank account for this sale.'); error.status = 400; throw error; }
-        await db.BankAccount.updateOne({ _id: bankAcc.id, shopId: req.shopId }, { balance: signedNum(bankAcc.balance) + totals.bankCollected });
+        const bankAcc = bankName ? await db.BankAccount.findOne({ shopId: req.shopId, bankName }) : null;
+        if (bankName && (!bankAcc || bankAcc.active === false)) { const error = new Error('Select an active bank account or leave the payment unassigned.'); error.status = 400; throw error; }
+        if (bankAcc) await db.BankAccount.updateOne({ _id: bankAcc.id, shopId: req.shopId }, { balance: signedNum(bankAcc.balance) + totals.bankCollected });
         await db.FinancialTransaction.create({
           shopId: req.shopId,
           txNo: 'FIN-' + String(Date.now()).slice(-6) + 'B',
@@ -1516,9 +1556,13 @@ apiRouter.post('/sales', async (req, res) => {
           reference: salePayment.bankAccount || '',
           partyName: custName,
           relatedId: invoiceNo,
-          note: `Bank payment (${bankName}) on ${invoiceNo}`,
+          note: `Bank payment${bankName ? ` (${bankName})` : ''} on ${invoiceNo}`,
           createdBy: req.user.name,
         });
+      }
+
+      if (req.body?.heldOrderId) {
+        await db.HeldOrder.deleteOne({ _id: req.body.heldOrderId, shopId: req.shopId, status: 'Held' });
       }
 
       await logAudit(
@@ -1742,6 +1786,25 @@ apiRouter.post('/installments/plans', async (req, res) => {
   }
 });
 
+apiRouter.patch('/installments/:planId/reminders', requireOwner, async (req, res) => {
+  const enabled = req.body?.enabled === true;
+  const customerConsent = req.body?.customerConsent === true;
+  let plan = await db.InstallmentPlan.findOne({ _id: req.params.planId, shopId: req.shopId });
+  if (!plan) plan = await db.InstallmentPlan.findOne({ planNo: req.params.planId, shopId: req.shopId });
+  if (!plan) plan = await db.InstallmentPlan.findOne({ invoiceNo: req.params.planId, shopId: req.shopId });
+  if (!plan) return res.status(404).json({ error: 'Installment account not found.' });
+  if (enabled && !customerConsent) return res.status(400).json({ error: 'Customer consent is required to enable WhatsApp reminders.' });
+  if (enabled && !normalizeWhatsAppNumber(plan.whatsapp || plan.phone)) {
+    return res.status(400).json({ error: 'Add a valid customer WhatsApp number before enabling reminders.' });
+  }
+  const updated = await db.InstallmentPlan.updateOne({ _id: plan.id, shopId: req.shopId }, {
+    whatsappReminderEnabled: enabled,
+    whatsappReminderConsent: enabled && customerConsent,
+    whatsappReminderConsentAt: enabled ? new Date().toISOString() : '',
+  });
+  return res.json({ plan: updated });
+});
+
 apiRouter.post('/installments/:planId/pay', async (req, res) => {
   try {
     const { amount, method = 'cash', bankName = '', reference = '', note = '', idempotencyKey } = req.body || {};
@@ -1785,6 +1848,7 @@ apiRouter.post('/installments/:planId/pay', async (req, res) => {
           paid: calc.newPaid,
           balance: calc.newBalance,
           status: calc.newStatus,
+          lastInstallmentPaymentAt: new Date().toISOString(),
           nextDueDate: calc.newStatus === 'Paid' ? 'Completed' : pakistanDateString(nextDue),
         }
       );
@@ -2217,6 +2281,7 @@ apiRouter.post('/stock-receipts', async (req, res) => {
 apiRouter.post('/returns', async (req, res) => {
   try {
     const {
+      idempotencyKey,
       invoiceNo,
       saleId,
       items = [],
@@ -2224,6 +2289,11 @@ apiRouter.post('/returns', async (req, res) => {
       refundMethod = 'cash',
       bankName = '',
     } = req.body || {};
+
+    if (idempotencyKey) {
+      const existingReturn = await db.CustomerReturn.findOne({ shopId: req.shopId, idempotencyKey: String(idempotencyKey) });
+      if (existingReturn) return res.json({ customerReturn: existingReturn, duplicate: true });
+    }
 
     let bill = null;
     if (saleId) {
@@ -2291,6 +2361,7 @@ apiRouter.post('/returns', async (req, res) => {
       // 2. Create CustomerReturn record
       const retRecord = await db.CustomerReturn.create({
         shopId: req.shopId,
+        idempotencyKey: String(idempotencyKey || ''),
         returnNo,
         saleId: bill.id,
         invoiceNo: bill.invoiceNo,
@@ -2382,10 +2453,15 @@ apiRouter.post('/orders', async (req, res) => {
       customerId = 'walkin',
       customerName = 'Walk-in customer',
       phone = '',
+      customerInfo = {},
+      salePhone = phone,
+      saleCnic = '',
+      saleAddress = '',
       saleType = 'cash',
       cartItems = [],
       billDiscount = 0,
       plan = {},
+      salePayment = {},
       total = 0,
       status = 'Held',
       note = '',
@@ -2393,6 +2469,17 @@ apiRouter.post('/orders', async (req, res) => {
 
     if (!Array.isArray(cartItems) || cartItems.length === 0) {
       return res.status(400).json({ error: 'Add at least one item before holding a bill or order.' });
+    }
+
+    if (req.body?.heldOrderId) {
+      const existing = await db.HeldOrder.findOne({ _id: req.body.heldOrderId, shopId: req.shopId, status: 'Held' });
+      if (!existing) return res.status(404).json({ error: 'The resumed held bill no longer exists.' });
+      const updatedOrder = await db.HeldOrder.updateOne({ _id: existing.id, shopId: req.shopId, status: 'Held' }, {
+        customerId, customerName: String(customerName || 'Walk-in customer').trim(), phone: String(phone || '').trim(),
+        salePhone: String(salePhone || '').trim(), saleCnic: String(saleCnic || '').trim(), saleAddress: String(saleAddress || '').trim(),
+        customerInfo, saleType, cartItems, billDiscount: num(billDiscount), plan, salePayment, total: num(total),
+      });
+      return res.json({ order: updatedOrder, updated: true });
     }
 
     const prefix = status === 'Held' ? 'HOLD' : 'ORD';
@@ -2410,10 +2497,15 @@ apiRouter.post('/orders', async (req, res) => {
       customerId,
       customerName: String(customerName || 'Walk-in customer').trim(),
       phone: String(phone || '').trim(),
+      salePhone: String(salePhone || '').trim(),
+      saleCnic: String(saleCnic || '').trim(),
+      saleAddress: String(saleAddress || '').trim(),
+      customerInfo,
       saleType,
       cartItems,
       billDiscount: num(billDiscount),
       plan,
+      salePayment,
       total: computedTotal,
       status,
       history: [
@@ -2472,7 +2564,10 @@ apiRouter.put('/orders/:id/status', async (req, res) => {
 });
 
 apiRouter.delete('/orders/:id', async (req, res) => {
-  const deleted = await db.HeldOrder.deleteOne({ _id: req.params.id, shopId: req.shopId });
+  const order = await db.HeldOrder.findOne({ _id: req.params.id, shopId: req.shopId });
+  if (!order) return res.status(404).json({ error: 'Held bill not found.' });
+  if (order.status !== 'Held') return res.status(409).json({ error: 'Only held bills can be deleted here.' });
+  const deleted = await db.HeldOrder.deleteOne({ _id: req.params.id, shopId: req.shopId, status: 'Held' });
   return res.json({ ok: deleted });
 });
 
@@ -2871,7 +2966,17 @@ apiRouter.get('/cash-register', async (req, res) => {
   const current = openSession
     ? { ...openSession, ...calculateCashSessionTotals(transactions, openSession) }
     : null;
-  return res.json({ current, sessions });
+  const sessionsWithMovementBreakdown = sessions.map((session) => {
+    if (session.status === 'open') {
+      return { ...session, ...(current || calculateCashSessionTotals(transactions, session)) };
+    }
+    const closedAt = new Date(session.closedAt || session.updatedAt || session.openedAt).getTime();
+    return {
+      ...session,
+      ...calculateCashSessionTotals(transactions, session, Number.isFinite(closedAt) ? closedAt : Date.now()),
+    };
+  });
+  return res.json({ current, sessions: sessionsWithMovementBreakdown });
 });
 
 apiRouter.post('/cash-register/open', async (req, res) => {

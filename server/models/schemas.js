@@ -23,6 +23,7 @@ const shopSchema = new Schema(
     currency: { type: String, default: 'PKR' },
     openingCash: { type: Number, default: 0 },
     taxNumber: { type: String, default: '' },
+    automation: { type: Schema.Types.Mixed, default: () => ({}) },
   },
   { timestamps: true }
 );
@@ -119,6 +120,7 @@ const saleSchema = new Schema(
   {
     shopId: { type: String, required: true, index: true },
     invoiceNo: { type: String, required: true },
+    padNo: { type: String, default: '' },
     idempotencyKey: { type: String, default: '' },
     customerId: { type: String, default: 'walkin' },
     customer: { type: String, default: 'Walk-in customer' },
@@ -184,6 +186,12 @@ const installmentPlanSchema = new Schema(
     startDate: { type: String, default: '' },
     nextDueDate: { type: String, default: '' },
     status: { type: String, default: 'Active' },
+    whatsappReminderEnabled: { type: Boolean, default: false },
+    whatsappReminderConsent: { type: Boolean, default: false },
+    whatsappReminderConsentAt: { type: String, default: '' },
+    lastWhatsAppReminderDate: { type: String, default: '' },
+    lastWhatsAppReminderMonth: { type: String, default: '' },
+    lastInstallmentPaymentAt: { type: String, default: '' },
   },
   { timestamps: true }
 );
@@ -344,6 +352,7 @@ chequeSchema.index({ shopId: 1, chequeNo: 1 });
 const customerReturnSchema = new Schema(
   {
     shopId: { type: String, required: true, index: true },
+    idempotencyKey: { type: String, default: '' },
     returnNo: { type: String, required: true },
     saleId: { type: String, required: true },
     invoiceNo: { type: String, required: true },
@@ -369,6 +378,11 @@ const heldOrderSchema = new Schema(
     customerId: { type: String, default: 'walkin' },
     customerName: { type: String, default: 'Walk-in customer' },
     phone: { type: String, default: '' },
+    salePhone: { type: String, default: '' },
+    saleCnic: { type: String, default: '' },
+    saleAddress: { type: String, default: '' },
+    customerInfo: { type: Schema.Types.Mixed, default: {} },
+    salePayment: { type: Schema.Types.Mixed, default: {} },
     saleType: { type: String, default: 'cash' },
     cartItems: { type: Array, default: [] },
     billDiscount: { type: Number, default: 0 },

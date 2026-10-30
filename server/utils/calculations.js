@@ -17,15 +17,30 @@ export function calculateCashSessionTotals(transactions, session, endTime = Date
   const start = new Date(session.openedAt).getTime();
   let cashIn = 0;
   let cashOut = 0;
+  const cashInByType = {};
+  const cashOutByType = {};
   for (const transaction of transactions) {
     if (String(transaction.method || '').toLowerCase() !== 'cash') continue;
     const createdAt = new Date(transaction.createdAt || 0).getTime();
     if (!Number.isFinite(createdAt) || createdAt < start || createdAt > endTime) continue;
     const amount = num(transaction.amount);
-    if (transaction.direction === 'in') cashIn += amount;
-    if (transaction.direction === 'out') cashOut += amount;
+    const type = String(transaction.type || 'other_cash_movement');
+    if (transaction.direction === 'in') {
+      cashIn += amount;
+      cashInByType[type] = (cashInByType[type] || 0) + amount;
+    }
+    if (transaction.direction === 'out') {
+      cashOut += amount;
+      cashOutByType[type] = (cashOutByType[type] || 0) + amount;
+    }
   }
-  return { cashIn, cashOut, expectedClosingAmount: num(session.openingAmount) + cashIn - cashOut };
+  return {
+    cashIn,
+    cashOut,
+    cashInByType,
+    cashOutByType,
+    expectedClosingAmount: num(session.openingAmount) + cashIn - cashOut,
+  };
 }
 
 const STOCK_WARRANTY_OPTIONS = new Set(Array.from({ length: 16 }, (_, index) => `${(index + 1) * 3} Months`));
@@ -395,18 +410,24 @@ export function calculateShopFinancialSummary({
   installmentPayments = [],
   openingCash = 0,
   supplierPayments = [],
+  financialTransactions = [],
   fromDate = null,
   toDate = null,
+  toDateExclusive = null,
 }) {
   const now = new Date();
-  const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  const tomorrowStart = new Date(todayStart);
-  tomorrowStart.setDate(tomorrowStart.getDate() + 1);
+  const todayKey = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Karachi', year: 'numeric', month: '2-digit', day: '2-digit',
+  }).format(now);
+  const [todayYear, todayMonth, todayDay] = todayKey.split('-').map(Number);
+  const todayStart = new Date(Date.UTC(todayYear, todayMonth - 1, todayDay) - 5 * 60 * 60 * 1000);
+  const tomorrowStart = new Date(todayStart.getTime() + 24 * 60 * 60 * 1000);
 
   const inPeriod = (dateStr) => {
-    if (!fromDate && !toDate) return true;
+    if (!fromDate && !toDate && !toDateExclusive) return true;
     const d = new Date(dateStr || now);
     if (fromDate && d < new Date(fromDate)) return false;
+    if (toDateExclusive && d >= new Date(toDateExclusive)) return false;
     if (toDate) {
       const end = new Date(toDate);
       end.setHours(23, 59, 59, 999);
@@ -425,10 +446,18 @@ export function calculateShopFinancialSummary({
   const periodExpenses = expenses.filter((e) => inPeriod(e.date || e.createdAt));
   const periodInstallmentPayments = installmentPayments.filter((p) => inPeriod(p.createdAt));
 
-  const todaySales = todayBills.reduce((s, b) => s + num(b.total), 0);
+  const todayReturnTotal = returns
+    .filter((r) => {
+      const date = new Date(r.createdAt || now);
+      return date >= todayStart && date < tomorrowStart;
+    })
+    .reduce((sum, r) => sum + num(r.totalReturnAmount), 0);
+  const todaySales = todayBills.reduce((s, b) => s + num(b.total), 0) - todayReturnTotal;
   const grossSales = periodBills.reduce((s, b) => s + num(b.gross || b.total), 0);
   const totalDiscounts = periodBills.reduce((s, b) => s + num(b.billDiscount), 0);
-  const netSales = periodBills.reduce((s, b) => s + num(b.total), 0);
+  const periodGrossRevenue = periodBills.reduce((s, b) => s + num(b.total), 0);
+  const returnsTotal = periodReturns.reduce((s, r) => s + num(r.totalReturnAmount), 0);
+  const netSales = periodGrossRevenue - returnsTotal;
 
   const cogs = periodBills.reduce((s, b) => {
     if (b.totalCost !== undefined) return s + num(b.totalCost);
@@ -440,7 +469,10 @@ export function calculateShopFinancialSummary({
   // Excludes unpaid credit/udhaar balances!
   const salesCollectedInPeriod = periodBills.reduce((s, b) => s + num(b.initialPaid !== undefined ? b.initialPaid : b.paid), 0);
   const khataCollectedInPeriod = periodInstallmentPayments.reduce((s, p) => s + num(p.amount), 0);
-  const collectedPayments = salesCollectedInPeriod + khataCollectedInPeriod;
+  const customerReceiptsInPeriod = financialTransactions
+    .filter((t) => t.type === 'customer_receipt' && t.direction === 'in' && inPeriod(t.createdAt))
+    .reduce((sum, t) => sum + num(t.amount), 0);
+  const collectedPayments = salesCollectedInPeriod + khataCollectedInPeriod + customerReceiptsInPeriod;
 
   // Customer balances (Cash/Credit sales with balance > 0 vs Installment plans with balance > 0)
   const cashCreditBillsWithBalance = bills.filter((b) => b.type !== 'installment' && num(b.balance) > 0);
@@ -453,15 +485,13 @@ export function calculateShopFinancialSummary({
   const totalCustomerOutstanding = customerCreditBalance + installmentBalance;
 
   // Returns impact in period
-  const returnsTotal = periodReturns.reduce((s, r) => s + num(r.totalReturnAmount), 0);
   const returnsCostRestored = periodReturns.reduce((s, r) => s + num(r.totalCostRestored), 0);
-  const returnsMarginLost = returnsTotal - returnsCostRestored;
 
   // Expenses in period
   const expensesTotal = periodExpenses.reduce((s, e) => s + num(e.amount), 0);
 
   // Net Profit = (Net Sales - COGS) - Return Margin Lost - Expenses
-  const grossProfit = netSales - cogs - returnsMarginLost;
+  const grossProfit = netSales - Math.max(0, cogs - returnsCostRestored);
   const netProfit = grossProfit - expensesTotal;
 
   // Cash in hand & Bank balances (all-time current state)
@@ -472,9 +502,10 @@ export function calculateShopFinancialSummary({
   const allCashExpensesOut = expenses
     .filter((e) => (e.paymentMethod || 'cash').toLowerCase() === 'cash')
     .reduce((s, e) => s + num(e.amount), 0);
-  const allCashReturnsOut = returns
-    .filter((r) => (r.refundMethod || 'cash').toLowerCase() === 'cash')
-    .reduce((s, r) => s + num(r.totalReturnAmount), 0);
+  const hasReturnLedger = financialTransactions.some((t) => t.type === 'return_refund');
+  const allCashReturnsOut = hasReturnLedger
+    ? financialTransactions.filter((t) => t.type === 'return_refund' && t.method === 'cash' && t.direction === 'out').reduce((s, t) => s + num(t.amount), 0)
+    : returns.filter((r) => (r.refundMethod || 'cash').toLowerCase() === 'cash').reduce((s, r) => s + num(r.totalReturnAmount), 0);
   const allCashSupplierOut = supplierPayments
     .filter((p) => (p.method || 'cash').toLowerCase() === 'cash')
     .reduce((s, p) => s + num(p.amount), 0);
@@ -487,7 +518,10 @@ export function calculateShopFinancialSummary({
     allCashReturnsOut -
     allCashSupplierOut;
 
-  const bankBalancesTotal = bankAccounts.reduce((s, b) => s + signedNum(b.balance), 0);
+  const unassignedBankBalance = financialTransactions
+    .filter((t) => String(t.method || '').toLowerCase() === 'bank' && !String(t.bankName || '').trim())
+    .reduce((sum, t) => sum + (t.direction === 'out' ? -num(t.amount) : num(t.amount)), 0);
+  const bankBalancesTotal = bankAccounts.reduce((s, b) => s + signedNum(b.balance), 0) + unassignedBankBalance;
 
   // Supplier payables
   const supplierPayablesTotal = suppliers.reduce((s, sup) => s + num(sup.balancePayable), 0);
@@ -501,6 +535,7 @@ export function calculateShopFinancialSummary({
   return {
     todaySales,
     todayBillsCount: todayBills.length,
+    todayReturnsTotal: todayReturnTotal,
     periodBillsCount: periodBills.length,
     grossSales,
     totalDiscounts,
@@ -513,6 +548,7 @@ export function calculateShopFinancialSummary({
     totalCustomerOutstanding,
     returnsTotal,
     returnsCount: periodReturns.length,
+    periodReceipts: collectedPayments,
     expensesTotal,
     expensesCount: periodExpenses.length,
     grossProfit,

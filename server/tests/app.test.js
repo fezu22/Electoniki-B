@@ -13,8 +13,9 @@ const {
   calculateShopFinancialSummary,
   calculateCashSessionTotals,
 } = await import('../utils/calculations.js');
-const { resetInMemoryStateForTests } = await import('../db.js');
+const { db, resetInMemoryStateForTests } = await import('../db.js');
 const { createApp } = await import('../index.js');
+const { shouldSendInstallmentReminder } = await import('../services/automationScheduler.js');
 
 // ============================================================================
 // PART 1: PURE UNIT TESTS (Calculations, Stock, Returns, Installments, Finance)
@@ -56,15 +57,37 @@ test('cash sale paid and due totals stay linked when the full invoice amount is 
   assert.equal(totals.balance, 0);
 });
 
+test('installment reminders are sent daily at 8 AM until Khata receives a payment', () => {
+  const plan = {
+    balance: 5000,
+    nextDueDate: '2026-10-10',
+    whatsappReminderEnabled: true,
+    whatsappReminderConsent: true,
+  };
+  assert.equal(shouldSendInstallmentReminder(plan, '2026-10-30', '2026-10', '08'), true);
+  assert.equal(shouldSendInstallmentReminder(plan, '2026-10-30', '2026-10', '09'), false);
+  assert.equal(shouldSendInstallmentReminder({ ...plan, lastWhatsAppReminderDate: '2026-10-30' }, '2026-10-30', '2026-10', '08'), false);
+  assert.equal(shouldSendInstallmentReminder({ ...plan, lastInstallmentPaymentAt: '2026-10-29T12:00:00.000Z' }, '2026-10-30', '2026-10', '08'), false);
+  assert.equal(shouldSendInstallmentReminder({ ...plan, lastInstallmentPaymentAt: '2026-09-29T12:00:00.000Z' }, '2026-10-30', '2026-10', '08'), true);
+  assert.equal(shouldSendInstallmentReminder(plan, '2026-10-30', '2026-10', '08', true), false);
+  assert.equal(shouldSendInstallmentReminder({ ...plan, whatsappReminderConsent: false }, '2026-10-30', '2026-10', '08'), false);
+});
+
 test('cash register closing reconciles opening cash with cash-only movements in the session', () => {
   const openedAt = '2026-10-29T09:00:00.000Z';
   const totals = calculateCashSessionTotals([
-    { method: 'cash', direction: 'in', amount: 12000, createdAt: '2026-10-29T10:00:00.000Z' },
-    { method: 'cash', direction: 'out', amount: 2500, createdAt: '2026-10-29T11:00:00.000Z' },
+    { type: 'sale_receipt', method: 'cash', direction: 'in', amount: 12000, createdAt: '2026-10-29T10:00:00.000Z' },
+    { type: 'supplier_payment', method: 'cash', direction: 'out', amount: 2500, createdAt: '2026-10-29T11:00:00.000Z' },
     { method: 'bank', direction: 'in', amount: 9000, createdAt: '2026-10-29T11:30:00.000Z' },
     { method: 'cash', direction: 'in', amount: 5000, createdAt: '2026-10-29T08:00:00.000Z' },
   ], { openedAt, openingAmount: 3000 }, new Date('2026-10-29T12:00:00.000Z').getTime());
-  assert.deepEqual(totals, { cashIn: 12000, cashOut: 2500, expectedClosingAmount: 12500 });
+  assert.deepEqual(totals, {
+    cashIn: 12000,
+    cashOut: 2500,
+    cashInByType: { sale_receipt: 12000 },
+    cashOutByType: { supplier_payment: 2500 },
+    expectedClosingAmount: 12500,
+  });
 });
 
 test('calculateSaleTotals computes installment plan surcharge, advance, balance, and monthly payment', () => {
@@ -214,6 +237,33 @@ test('calculateShopFinancialSummary computes profit, cash in hand, and excludes 
   assert.equal(summary.customerCreditBalance, 30000);
   // Cash in hand = 40,000 opening + 50,000 cash sale - 5,000 cash expense = 85,000
   assert.equal(summary.cashInHand, 85000);
+});
+
+test('period summaries apply Pakistan-day sales, dated returns, receipts, expenses, and bank snapshots once', () => {
+  const summary = calculateShopFinancialSummary({
+    fromDate: '2026-10-29T19:00:00.000Z',
+    toDateExclusive: '2026-10-30T19:00:00.000Z',
+    bills: [
+      { total: 10000, gross: 10000, totalCost: 6000, initialPaid: 10000, cashCollected: 10000, balance: 0, createdAt: '2026-10-29T19:30:00.000Z' },
+      { total: 50000, gross: 50000, totalCost: 30000, initialPaid: 30000, cashCollected: 30000, balance: 20000, createdAt: '2026-10-28T19:30:00.000Z' },
+    ],
+    returns: [{ totalReturnAmount: 2000, totalCostRestored: 1200, refundMethod: 'credit_adjustment', createdAt: '2026-10-30T00:30:00.000Z' }],
+    expenses: [{ amount: 300, paymentMethod: 'cash', createdAt: '2026-10-30T01:00:00.000Z' }],
+    products: [], suppliers: [], bankAccounts: [{ balance: 1000 }], installmentPayments: [], supplierPayments: [],
+    financialTransactions: [
+      { type: 'customer_receipt', direction: 'in', amount: 500, createdAt: '2026-10-30T01:00:00.000Z' },
+      { type: 'sale_receipt', direction: 'in', method: 'bank', amount: 15000, bankName: '', createdAt: '2026-10-30T01:00:00.000Z' },
+      { type: 'return_refund', direction: 'out', method: 'bank', amount: 2000, bankName: '', createdAt: '2026-10-30T02:00:00.000Z' },
+    ],
+  });
+
+  assert.equal(summary.netSales, 8000, 'today activity subtracts an older invoice return on the return date');
+  assert.equal(summary.returnsTotal, 2000);
+  assert.equal(summary.periodBillsCount, 1);
+  assert.equal(summary.collectedPayments, 10500);
+  assert.equal(summary.expensesTotal, 300);
+  assert.equal(summary.grossProfit, 3200, 'returned inventory cost is restored once');
+  assert.equal(summary.bankBalancesTotal, 14000, 'unassigned bank receipts and refunds supplement named accounts');
 });
 
 // ============================================================================
@@ -427,6 +477,7 @@ test('Multi-tenant isolation, RBAC permissions, sales, returns, installments, an
       method: 'POST',
       token: ownerToken,
       body: {
+        idempotencyKey: 'idem-return-001',
         invoiceNo: saleRes.data.sale.invoiceNo,
         items: [{ productId, qty: 1 }],
         reason: 'Customer exchanged model',
@@ -438,6 +489,71 @@ test('Multi-tenant isolation, RBAC permissions, sales, returns, installments, an
     const afterReturnProducts = await api('/products', { token: ownerToken });
     const testSpeakerAfterReturn = afterReturnProducts.data.products.find((p) => p.id === productId);
     assert.equal(testSpeakerAfterReturn.stock, 3);
+
+    const duplicateReturn = await api('/returns', {
+      method: 'POST', token: ownerToken,
+      body: {
+        idempotencyKey: 'idem-return-001', invoiceNo: saleRes.data.sale.invoiceNo,
+        items: [{ productId, qty: 1 }], reason: 'Customer exchanged model', refundMethod: 'cash',
+      },
+    });
+    assert.equal(duplicateReturn.data.duplicate, true);
+    assert.equal((await api('/products', { token: ownerToken })).data.products.find((p) => p.id === productId).stock, 3);
+
+    const held = await api('/orders', {
+      method: 'POST', token: ownerToken,
+      body: {
+        customerId: 'walkin', customerName: 'Walk-in customer', saleType: 'cash',
+        cartItems: [{ productId, qty: 1, price: 15000 }], total: 15000, status: 'Held',
+        salePayment: { method: 'cash', cash: '15000' }, customerInfo: { name: 'Walk-in customer' },
+      },
+    });
+    assert.equal(held.status, 201);
+    const heldSaleBody = {
+      idempotencyKey: `sale-held-${held.data.order.id}`, heldOrderId: held.data.order.id,
+      customerId: 'walkin', saleType: 'cash', items: [{ productId, qty: 1, price: 15000 }],
+      salePayment: { method: 'cash', cash: '15000' },
+    };
+    const heldSale = await api('/sales', { method: 'POST', token: ownerToken, body: heldSaleBody });
+    assert.equal(heldSale.status, 201);
+    assert.equal((await api('/bootstrap', { token: ownerToken })).data.heldOrders.some((order) => order.id === held.data.order.id), false);
+    const heldSaleRetry = await api('/sales', { method: 'POST', token: ownerToken, body: heldSaleBody });
+    assert.equal(heldSaleRetry.data.duplicate, true);
+    assert.equal((await api('/products', { token: ownerToken })).data.products.find((p) => p.id === productId).stock, 2);
+
+    const genericBankSale = await api('/sales', {
+      method: 'POST', token: ownerToken,
+      body: {
+        idempotencyKey: 'idem-generic-bank-sale', customerId: 'walkin', saleType: 'cash',
+        items: [{ productId, qty: 1, price: 15000 }],
+        salePayment: { method: 'bank', bank: '15000', bankName: '' },
+      },
+    });
+    assert.equal(genericBankSale.status, 201);
+    const bankSummary = await api('/bootstrap', { token: ownerToken });
+    assert.equal(bankSummary.data.summary.bankBalancesTotal, 15000);
+    assert.equal(bankSummary.data.financialTransactions.some((tx) => tx.method === 'bank' && tx.relatedId === genericBankSale.data.sale.invoiceNo && !tx.bankName), true);
+
+    const cashRegisterOpen = await api('/cash-register/open', {
+      method: 'POST', token: ownerToken, body: { openingAmount: 20 },
+    });
+    assert.equal(cashRegisterOpen.status, 201);
+    await db.FinancialTransaction.create({
+      shopId: ownerLogin.data.shop.id, type: 'supplier_payment', direction: 'out',
+      method: 'cash', amount: 100, createdAt: new Date().toISOString(),
+    });
+    const liveCashRegister = await api('/cash-register', { token: ownerToken });
+    assert.equal(liveCashRegister.data.current.cashOutByType.supplier_payment, 100);
+    assert.equal(liveCashRegister.data.current.expectedClosingAmount, -80);
+    const closedCashRegister = await api('/cash-register/close', {
+      method: 'POST', token: ownerToken, body: { actualClosingAmount: 0 },
+    });
+    assert.equal(closedCashRegister.status, 200);
+    const cashRegisterHistory = await api('/cash-register', { token: ownerToken });
+    assert.equal(cashRegisterHistory.data.sessions[0].cashOutByType.supplier_payment, 100);
+
+    const futureDashboard = await api('/bootstrap?period=date&date=9999-01-01', { token: ownerToken });
+    assert.equal(futureDashboard.status, 400);
 
     // 10. Shop 2 data remained completely untouched
     const shop2Boot = await api('/bootstrap', { token: shop2Token });
@@ -619,10 +735,11 @@ test('Finance and expense edits keep invoice, bank, and ledger balances in sync'
 
     const product = await api('/products', { method: 'POST', token, body: { name: 'Test item', code: 'LEDGER-1', cost: 50, price: 100, stock: 2 } });
     const sale = await api('/sales', { method: 'POST', token, body: {
-      customerId: 'new', customerInfo: { name: 'Ledger Customer' }, saleType: 'cash', items: [{ productId: product.data.product.id, qty: 1, price: 100 }],
+      customerId: 'new', customerInfo: { name: 'Ledger Customer' }, padNo: 'PAD-42', saleType: 'cash', items: [{ productId: product.data.product.id, qty: 1, price: 100 }],
       salePayment: { method: 'cash', cash: 40 },
     } });
     assert.equal(sale.status, 201);
+    assert.equal(sale.data.sale.padNo, 'PAD-42');
 
     const invalidMethod = await api('/finance/transactions', { method: 'POST', token, body: {
       type: 'arbitrary', direction: 'out', method: 'split', amount: 1, relatedId: sale.data.sale.invoiceNo,
@@ -728,6 +845,13 @@ test('Installment sales save customer and guarantor photos inside one details ob
     } });
     assert.equal(registration.status, 201);
     const token = registration.data.token;
+    const settings = await api('/settings', { method: 'PUT', token, body: {
+      name: 'Installment Photo Test', automation: {
+        installmentRemindersEnabled: true, lowStockAlertsEnabled: false, lowStockRecipients: [],
+      },
+    } });
+    assert.equal(settings.status, 200);
+    assert.equal(settings.data.shop.automation.installmentRemindersEnabled, true);
     const product = await api('/products', { token, body: { name: 'Test fan', code: 'PHOTO-1', cost: 50, price: 100, stock: 2 } });
     assert.equal(product.status, 201);
     const customerPhoto = 'data:image/jpeg;base64,/9j/2Q==';
@@ -748,6 +872,13 @@ test('Installment sales save customer and guarantor photos inside one details ob
     assert.equal(storedPlan.installmentDetails.guarantor.photoDataUrl, guarantorPhoto);
     assert.equal(storedPlan.installmentDetails.plan.months, 10);
     assert.equal(storedPlan.installmentDetails.customer.cnic, '12345-1234567-1');
+
+    const reminderOptIn = await api(`/installments/${storedPlan.id}/reminders`, {
+      method: 'PATCH', token, body: { enabled: true, customerConsent: true },
+    });
+    assert.equal(reminderOptIn.status, 200);
+    assert.equal(reminderOptIn.data.plan.whatsappReminderEnabled, true);
+    assert.equal(reminderOptIn.data.plan.whatsappReminderConsent, true);
 
     const invalidPhotoSale = await api('/sales', { token, body: {
       customerId: 'new', saleType: 'installment', customerInfo: { name: 'Invalid Photo', customerPhoto: 'data:application/pdf;base64,AA==' },

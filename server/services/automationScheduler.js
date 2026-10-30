@@ -16,6 +16,8 @@ function pakistanDateParts(date) {
     year: 'numeric',
     month: '2-digit',
     day: '2-digit',
+    hour: '2-digit',
+    hourCycle: 'h23',
   }).formatToParts(date);
   return Object.fromEntries(parts.filter((part) => part.type !== 'literal').map(({ type, value }) => [type, value]));
 }
@@ -67,15 +69,13 @@ async function processLowStockAlerts(shop, products, configReady) {
   }
 }
 
-async function processInstallmentReminders(shop, plans, dateKey, monthKey, configReady) {
+async function processInstallmentReminders(shop, plans, paidPlanIdsThisMonth, dateKey, monthKey, hour, configReady) {
   const automation = shop.automation || {};
   if (!automation.installmentRemindersEnabled || !configReady) return;
   const config = getWhatsAppAutomationConfig();
 
   for (const plan of plans) {
-    if (Number(plan.balance || 0) <= 0 || !plan.whatsappReminderEnabled || !plan.whatsappReminderConsent) continue;
-    if (!plan.nextDueDate || plan.nextDueDate === 'Completed' || plan.nextDueDate > dateKey) continue;
-    if (plan.lastWhatsAppReminderMonth === monthKey) continue;
+    if (!shouldSendInstallmentReminder(plan, dateKey, monthKey, hour, paidPlanIdsThisMonth.has(String(plan.id)))) continue;
 
     const recipient = normalizeWhatsAppNumber(plan.whatsapp || plan.phone);
     if (!recipient) continue;
@@ -94,7 +94,7 @@ async function processInstallmentReminders(shop, plans, dateKey, monthKey, confi
       });
       await db.InstallmentPlan.updateOne(
         { _id: plan.id, shopId: shop.id },
-        { lastWhatsAppReminderMonth: monthKey }
+        { lastWhatsAppReminderDate: dateKey, lastWhatsAppReminderMonth: monthKey }
       );
     } catch (error) {
       console.error(`Installment WhatsApp reminder failed for plan ${plan.planNo}:`, error.message);
@@ -102,24 +102,44 @@ async function processInstallmentReminders(shop, plans, dateKey, monthKey, confi
   }
 }
 
+export function shouldSendInstallmentReminder(plan, dateKey, monthKey, hour, paymentRecordedThisMonth = false) {
+  if (hour !== '08') return false;
+  if (paymentRecordedThisMonth) return false;
+  if (Number(plan.balance || 0) <= 0 || !plan.whatsappReminderEnabled || !plan.whatsappReminderConsent) return false;
+  if (!plan.nextDueDate || plan.nextDueDate === 'Completed' || plan.nextDueDate > dateKey) return false;
+  if (plan.lastWhatsAppReminderDate === dateKey) return false;
+    if (plan.lastInstallmentPaymentAt) {
+    const paymentDate = pakistanDateParts(new Date(plan.lastInstallmentPaymentAt));
+    if (`${paymentDate.year}-${paymentDate.month}` === monthKey) return false;
+  }
+  return true;
+}
+
 export async function runAutomationCycle(now = new Date()) {
   if (cycleRunning) return;
   cycleRunning = true;
   try {
-    const { year, month, day } = pakistanDateParts(now);
+    const { year, month, day, hour } = pakistanDateParts(now);
     const dateKey = `${year}-${month}-${day}`;
     const monthKey = `${year}-${month}`;
     const shops = await db.Shop.find({});
     const configReady = isWhatsAppAutomationConfigured();
 
     for (const shop of shops) {
-      const [products, plans] = await Promise.all([
+      const [products, plans, payments] = await Promise.all([
         db.Product.find({ shopId: shop.id }),
         db.InstallmentPlan.find({ shopId: shop.id }),
+        db.InstallmentPayment.find({ shopId: shop.id }),
       ]);
+      const paidPlanIdsThisMonth = new Set(payments
+        .filter((payment) => payment.createdAt && (() => {
+          const paymentDate = pakistanDateParts(new Date(payment.createdAt));
+          return `${paymentDate.year}-${paymentDate.month}` === monthKey;
+        })())
+        .map((payment) => String(payment.planId)));
       await resetRecoveredStockAlerts(shop.id, products);
       await processLowStockAlerts(shop, products, configReady);
-      await processInstallmentReminders(shop, plans, dateKey, monthKey, configReady);
+      await processInstallmentReminders(shop, plans, paidPlanIdsThisMonth, dateKey, monthKey, hour, configReady);
     }
   } finally {
     cycleRunning = false;

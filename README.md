@@ -14,7 +14,7 @@ The backend runs as an API by default. To also serve a built frontend in product
 
 ## WhatsApp automations
 
-The long-running backend checks for due installments and low-stock products every five minutes. It sends at most one installment reminder per plan per Pakistan calendar month, on or after the due date, while the plan is unpaid and its customer reminder consent is enabled. Low-stock alerts go to the two configured shop recipient numbers once per low-stock period; restocking above the threshold rearms the next alert.
+The long-running backend checks for due installments and low-stock products every five minutes. It sends one installment reminder per opted-in plan each day at 8:00 AM Pakistan time after its due date, until a payment is recorded in Khata, the plan is paid, or reminders are disabled. Low-stock alerts go to the two configured shop recipient numbers once per low-stock period; restocking above the threshold rearms the next alert.
 
 Automated messages use Meta WhatsApp Cloud API. Configure `WHATSAPP_ACCESS_TOKEN`, `WHATSAPP_PHONE_NUMBER_ID`, and the Graph API version in the backend environment. Create and get approval for two Utility templates matching these body variables in order:
 
