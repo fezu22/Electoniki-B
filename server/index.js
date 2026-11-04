@@ -16,6 +16,36 @@ const __dirname = path.dirname(__filename);
 export function createApp() {
   const app = express();
 
+  app.disable('x-powered-by');
+  app.use((req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    if (req.path.startsWith('/api/')) res.setHeader('Cache-Control', 'no-store');
+    next();
+  });
+
+  // The browser app and API share an origin, including through the Vite proxy.
+  // Reject state-changing requests from other origins, including login/logout.
+  app.use('/api', (req, res, next) => {
+    if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next();
+    const origin = req.get('Origin');
+    if (req.get('Sec-Fetch-Site') === 'cross-site') {
+      return res.status(403).json({ error: 'Cross-site requests are not allowed.' });
+    }
+    if (origin) {
+      try {
+        const parsed = new URL(origin);
+        if (!['http:', 'https:'].includes(parsed.protocol) || parsed.host.toLowerCase() !== String(req.get('Host') || '').toLowerCase()) {
+          return res.status(403).json({ error: 'Cross-origin requests are not allowed.' });
+        }
+      } catch {
+        return res.status(403).json({ error: 'Invalid request origin.' });
+      }
+    }
+    next();
+  });
+
   // A 10 MiB invoice expands to ~13.4 MiB when encoded as a data URL.
   app.use(express.json({ limit: '16mb' }));
   app.use(express.urlencoded({ extended: true, limit: '12mb' }));
@@ -24,7 +54,7 @@ export function createApp() {
   // Rate limiting for auth endpoints
   const authLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
-    max: 120,
+    max: 20,
     standardHeaders: true,
     legacyHeaders: false,
     message: { error: 'Too many authentication attempts, please try again shortly.' },
@@ -47,7 +77,7 @@ export function createApp() {
   app.use('/api', (err, _req, res, _next) => {
     console.error('API Error:', err?.message || err);
     res.status(err?.status || 500).json({
-      error: err?.message || 'An unexpected server error occurred.',
+      error: err?.status >= 400 && err?.status < 500 ? err.message : 'An unexpected server error occurred.',
     });
   });
 

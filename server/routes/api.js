@@ -13,6 +13,7 @@ import {
   signAuthToken,
   extractToken,
   verifyAuthToken,
+  tokenMatchesUser,
   requireAuth,
   requireOwner,
   requireSuperAdmin,
@@ -99,7 +100,7 @@ apiRouter.get('/auth/me', async (req, res) => {
       return res.json({ authenticated: false });
     }
     const user = await db.User.findOne({ _id: decoded.sub, shopId: decoded.shopId });
-    if (!user || user.active === false) {
+    if (!user || user.active === false || !tokenMatchesUser(decoded, user)) {
       return res.json({ authenticated: false });
     }
     const shop = await db.Shop.findById(user.shopId);
@@ -210,7 +211,7 @@ apiRouter.post('/auth/register-shop', async (req, res) => {
       shop: result.shop,
     });
   } catch (err) {
-    return res.status(500).json({ error: err.message || 'Could not register shop.' });
+    return res.status(500).json({ error: 'Could not register shop.' });
   }
 });
 
@@ -1535,7 +1536,7 @@ apiRouter.post('/sales', async (req, res) => {
 
     return res.status(201).json(result);
   } catch (err) {
-    return res.status(err.status || 500).json({ error: err.message || 'Failed to save sale.' });
+    return res.status(err.status || 500).json({ error: err.status && err.status < 500 ? err.message : 'Failed to save sale.' });
   }
 });
 
@@ -1738,7 +1739,7 @@ apiRouter.post('/installments/plans', async (req, res) => {
 
     return res.status(201).json(result);
   } catch (err) {
-    return res.status(500).json({ error: err.message || 'Failed to add installment customer.' });
+    return res.status(500).json({ error: 'Failed to add installment customer.' });
   }
 });
 
@@ -1852,7 +1853,7 @@ apiRouter.post('/installments/:planId/pay', async (req, res) => {
 
     return res.status(201).json(result);
   } catch (err) {
-    return res.status(err.status || 500).json({ error: err.status ? err.message : err.message || 'Failed to record installment payment.' });
+    return res.status(err.status || 500).json({ error: err.status && err.status < 500 ? err.message : 'Failed to record installment payment.' });
   }
 });
 
@@ -2206,7 +2207,7 @@ apiRouter.post('/stock-receipts', async (req, res) => {
     return res.status(201).json(result);
   } catch (err) {
     return res.status(err.code === 11000 ? 409 : err.status || 500).json({
-      error: err.code === 11000 ? 'Duplicate supplier invoice is blocked.' : err.message || 'Failed to save stock receipt.' });
+      error: err.code === 11000 ? 'Duplicate supplier invoice is blocked.' : err.status && err.status < 500 ? err.message : 'Failed to save stock receipt.' });
   }
 });
 
@@ -2368,7 +2369,7 @@ apiRouter.post('/returns', async (req, res) => {
 
     return res.status(201).json(result);
   } catch (err) {
-    return res.status(err.status || 500).json({ error: err.message || 'Failed to process customer return.' });
+    return res.status(err.status || 500).json({ error: err.status && err.status < 500 ? err.message : 'Failed to process customer return.' });
   }
 });
 
@@ -2575,7 +2576,7 @@ apiRouter.post('/suppliers/:id/pay', async (req, res) => {
 
     return res.status(201).json(result);
   } catch (err) {
-    return res.status(err.status || 500).json({ error: err.status ? err.message : 'Failed to record supplier payment.' });
+    return res.status(err.status || 500).json({ error: err.status && err.status < 500 ? err.message : 'Failed to record supplier payment.' });
   }
 });
 
@@ -2671,7 +2672,7 @@ apiRouter.post('/expenses', async (req, res) => {
 
     return res.status(201).json(result);
   } catch (err) {
-    return res.status(err.status || 500).json({ error: err.status ? err.message : 'Failed to save expense.' });
+    return res.status(err.status || 500).json({ error: err.status && err.status < 500 ? err.message : 'Failed to save expense.' });
   }
 });
 
@@ -2729,7 +2730,7 @@ apiRouter.put('/expenses/:id', async (req, res) => {
     });
     return res.json(result);
   } catch (err) {
-    return res.status(err.status || 500).json({ error: err.status ? err.message : 'Failed to update expense.' });
+    return res.status(err.status || 500).json({ error: err.status && err.status < 500 ? err.message : 'Failed to update expense.' });
   }
 });
 
@@ -3009,7 +3010,7 @@ apiRouter.post('/finance/transactions', async (req, res) => {
     });
     return res.status(201).json(result);
   } catch (err) {
-    return res.status(err.status || 500).json({ error: err.status ? err.message : 'Failed to record financial transaction.' });
+    return res.status(err.status || 500).json({ error: err.status && err.status < 500 ? err.message : 'Failed to record financial transaction.' });
   }
 });
 

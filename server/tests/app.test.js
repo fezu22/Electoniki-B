@@ -20,6 +20,50 @@ const { createApp } = await import('../index.js');
 // PART 1: PURE UNIT TESTS (Calculations, Stock, Returns, Installments, Finance)
 // ============================================================================
 
+test('browser origin checks and password changes protect existing sessions', async () => {
+  resetInMemoryStateForTests();
+  const server = await new Promise((resolve) => {
+    const instance = createApp().listen(0, '127.0.0.1', () => resolve(instance));
+  });
+  const origin = `http://127.0.0.1:${server.address().port}`;
+  const request = (path, options = {}) => fetch(`${origin}/api${path}`, options);
+  try {
+    const crossOrigin = await request('/auth/login', {
+      method: 'POST', headers: { Origin: 'https://attacker.invalid', 'Content-Type': 'application/json' }, body: '{}',
+    });
+    assert.equal(crossOrigin.status, 403);
+    const crossSite = await request('/auth/logout', { method: 'POST', headers: { 'Sec-Fetch-Site': 'cross-site' } });
+    assert.equal(crossSite.status, 403);
+    const registration = await request('/auth/register-shop', {
+      method: 'POST', headers: { Origin: origin, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ shopName: 'Security Shop', ownerName: 'Owner', email: 'security@example.invalid', password: 'InitialPassword123' }),
+    });
+    assert.equal(registration.status, 201);
+    assert.equal(registration.headers.get('x-content-type-options'), 'nosniff');
+    assert.equal(registration.headers.get('cache-control'), 'no-store');
+    const session = await registration.json();
+    const change = await request(`/users/${session.user.id}`, {
+      method: 'PUT', headers: { Origin: origin, Authorization: `Bearer ${session.token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ newPassword: 'UpdatedPassword123' }),
+    });
+    assert.equal(change.status, 200);
+    const oldSession = await request('/auth/me', { headers: { Authorization: `Bearer ${session.token}` } });
+    assert.equal((await oldSession.json()).authenticated, false);
+    const protectedRequest = await request('/bootstrap', { headers: { Authorization: `Bearer ${session.token}` } });
+    assert.equal(protectedRequest.status, 403);
+    const login = await request('/auth/login', {
+      method: 'POST', headers: { Origin: origin, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'security@example.invalid', password: 'UpdatedPassword123' }),
+    });
+    assert.equal(login.status, 200);
+    const freshSession = await login.json();
+    assert.equal((await request('/bootstrap', { headers: { Authorization: `Bearer ${freshSession.token}` } })).status, 200);
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
 test('verifyTenantAccess strictly enforces matching shopId', () => {
   assert.equal(verifyTenantAccess('shop_1', 'shop_1'), true);
   assert.equal(verifyTenantAccess('shop_1', 'shop_2'), false);
