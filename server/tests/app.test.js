@@ -20,6 +20,31 @@ const { createApp } = await import('../index.js');
 // PART 1: PURE UNIT TESTS (Calculations, Stock, Returns, Installments, Finance)
 // ============================================================================
 
+test('invoice ditto marks repeat descriptions and retain each row model and values', async () => {
+  const { normalizeInvoiceDraft } = await import('../utils/invoiceOcr.js');
+  const draft = normalizeInvoiceDraft({ items: [
+    { name: 'Diamond washing machine Model 202', model: '202', qty: 3, cost: 13800, lineTotal: 41400 },
+    { name: 'Model 222', model: '222', descriptionDitto: true, qty: 5, cost: 14800, lineTotal: 74000 },
+    { name: 'Model 333', model: '333', descriptionMarks: '///', qty: 2, cost: 16000, lineTotal: 32000 },
+    { name: 'Model 550', descriptionMarks: '////', qty: 10, cost: 14200, lineTotal: 142000 },
+    { name: '//', model: '444', qty: 4, cost: 11800, lineTotal: 47200 },
+    { name: 'Other appliance', model: 'A/500', qty: 7, cost: 12000, lineTotal: 84000 },
+  ] });
+  assert.deepEqual(draft.items.slice(0, 5).map((item) => item.name), [
+    'Diamond washing machine Model 202', 'Diamond washing machine - Model 222',
+    'Diamond washing machine - Model 333', 'Diamond washing machine - Model 550',
+    'Diamond washing machine - Model 444',
+  ]);
+  assert.deepEqual(draft.items.slice(0, 5).map((item) => [item.qty, item.cost, item.lineTotal]), [
+    [3, 13800, 41400], [5, 14800, 74000], [2, 16000, 32000], [10, 14200, 142000], [4, 11800, 47200],
+  ]);
+  assert.equal(draft.items[5].name, 'Other appliance - Model A/500');
+  assert.equal(draft.items[5].descriptionDitto, false);
+  const separate = normalizeInvoiceDraft({ items: [{ name: '//', model: '999', qty: 1, cost: 10 }] });
+  assert.equal(separate.items[0].name, '');
+  assert.ok(separate.warnings.some((warning) => warning.includes('without a readable product description')));
+});
+
 test('browser origin checks and password changes protect existing sessions', async () => {
   resetInMemoryStateForTests();
   const server = await new Promise((resolve) => {

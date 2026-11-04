@@ -1,4 +1,5 @@
-import { INVOICE_OCR_PROMPT, normalizeInvoiceDraft } from '../utils/invoiceOcr.js';
+import { normalizeInvoiceDraft } from '../utils/invoiceOcr.js';
+import { INVOICE_OCR_PROMPT } from '../utils/invoiceOcrPrompt.js';
 import express from 'express';
 import crypto from 'crypto';
 import nodemailer from 'nodemailer';
