@@ -77,6 +77,7 @@ const customerSchema = new Schema(
     guarantor: { type: String, default: '', trim: true },
     guarantorPhone: { type: String, default: '', trim: true },
     guarantorAddress: { type: String, default: '', trim: true },
+    guarantorCnic: { type: String, default: '', trim: true },
     creditBalance: { type: Number, default: 0 },
   },
   { timestamps: true }
@@ -131,6 +132,7 @@ const saleSchema = new Schema(
     guarantor: { type: String, default: '' },
     guarantorPhone: { type: String, default: '' },
     guarantorAddress: { type: String, default: '' },
+    guarantorCnic: { type: String, default: '' },
     type: { type: String, enum: ['cash', 'installment'], default: 'cash' },
     items: [saleItemSchema],
     gross: { type: Number, required: true },
@@ -175,6 +177,7 @@ const installmentPlanSchema = new Schema(
     guarantor: { type: String, default: '' },
     guarantorPhone: { type: String, default: '' },
     guarantorAddress: { type: String, default: '' },
+    guarantorCnic: { type: String, default: '' },
     productSummary: { type: String, default: '' },
     totalAmount: { type: Number, required: true },
     advancePaid: { type: Number, default: 0 },

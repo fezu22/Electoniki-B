@@ -1374,6 +1374,7 @@ apiRouter.post('/sales', async (req, res) => {
       const guarantorAddress = String(
         customerInfo?.guarantorAddress || resolvedCustomer?.guarantorAddress || ''
       ).trim();
+      const guarantorCnic = String(customerInfo?.guarantorCnic || resolvedCustomer?.guarantorCnic || '').trim();
 
       if (resolvedCustomer) {
         resolvedCustomer = await db.Customer.updateOne(
@@ -1387,6 +1388,7 @@ apiRouter.post('/sales', async (req, res) => {
             guarantor: guarantor || resolvedCustomer.guarantor,
             guarantorPhone: guarantorPhone || resolvedCustomer.guarantorPhone,
             guarantorAddress: guarantorAddress || resolvedCustomer.guarantorAddress,
+            guarantorCnic: guarantorCnic || resolvedCustomer.guarantorCnic,
             creditBalance:
               saleType === 'cash' && totals.balance > 0
                 ? num(resolvedCustomer.creditBalance) + totals.balance
@@ -1404,6 +1406,7 @@ apiRouter.post('/sales', async (req, res) => {
           guarantor,
           guarantorPhone,
           guarantorAddress,
+          guarantorCnic,
           creditBalance: saleType === 'cash' ? totals.balance : 0,
         });
       }
@@ -1462,6 +1465,7 @@ apiRouter.post('/sales', async (req, res) => {
         guarantor,
         guarantorPhone,
         guarantorAddress,
+        guarantorCnic,
         type: saleType,
         items: totals.items,
         gross: totals.gross,
@@ -1511,6 +1515,7 @@ apiRouter.post('/sales', async (req, res) => {
               name: guarantor,
               phone: guarantorPhone,
               address: guarantorAddress,
+              cnic: guarantorCnic,
               photoDataUrl: String(customerInfo?.guarantorPhoto || ''),
             },
             plan: {
@@ -1531,6 +1536,7 @@ apiRouter.post('/sales', async (req, res) => {
           guarantor,
           guarantorPhone,
           guarantorAddress,
+          guarantorCnic,
           productSummary: totals.items.map((i) => `${i.name} × ${i.qty}`).join(', '),
           totalAmount: totals.final,
           advancePaid: totals.paid,
