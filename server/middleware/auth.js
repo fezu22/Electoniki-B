@@ -1,11 +1,12 @@
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
+import crypto from 'node:crypto';
 import { db } from '../db.js';
 
 const JWT_SECRET = process.env.JWT_SECRET || '';
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '30d';
-if (JWT_SECRET.length < 32) {
-  throw new Error('JWT_SECRET is required and must contain at least 32 characters. Set it in backend/.env.');
+if (JWT_SECRET.length < 32 || /^(?:change|replace|your|my)[-_ ]/i.test(JWT_SECRET)) {
+  throw new Error('JWT_SECRET must be a unique random secret of at least 32 characters. Set it in backend/.env.');
 }
 
 function durationToMilliseconds(value) {
@@ -29,6 +30,7 @@ export async function verifyPassword(plain, hash) {
 }
 
 export function signAuthToken(user) {
+  if (!user?.passwordHash) throw new Error('Cannot create a session without a password hash.');
   return jwt.sign(
     {
       sub: String(user.id || user._id),
@@ -36,6 +38,7 @@ export function signAuthToken(user) {
       role: user.role,
       email: user.email,
       name: user.name,
+      passwordVersion: crypto.createHmac('sha256', JWT_SECRET).update(String(user.passwordHash)).digest('hex'),
     },
     JWT_SECRET,
     { expiresIn: JWT_EXPIRES_IN }
@@ -44,10 +47,17 @@ export function signAuthToken(user) {
 
 export function verifyAuthToken(token) {
   try {
-    return jwt.verify(token, JWT_SECRET);
+    return jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'] });
   } catch {
     return null;
   }
+}
+
+// A password change invalidates every previously issued session for that user.
+export function tokenMatchesUser(decoded, user) {
+  if (!user?.passwordHash || !/^[a-f0-9]{64}$/.test(String(decoded?.passwordVersion || ''))) return false;
+  const expected = crypto.createHmac('sha256', JWT_SECRET).update(String(user.passwordHash)).digest();
+  return crypto.timingSafeEqual(expected, Buffer.from(decoded.passwordVersion, 'hex'));
 }
 
 export function extractToken(req) {
@@ -78,7 +88,7 @@ export async function requireAuth(req, res, next) {
     }
 
     const user = await db.User.findOne({ _id: decoded.sub, shopId: decoded.shopId });
-    if (!user || user.active === false) {
+    if (!user || user.active === false || !tokenMatchesUser(decoded, user)) {
       return res.status(403).json({ error: 'User account is inactive or no longer exists.' });
     }
 

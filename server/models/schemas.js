@@ -410,6 +410,7 @@ const cashSessionSchema = new Schema(
     openingNote: { type: String, default: '' },
     closedAt: { type: String, default: '' },
     closedBy: { type: String, default: '' },
+    autoClosed: { type: Boolean, default: false },
     expectedClosingAmount: { type: Number, default: 0 },
     actualClosingAmount: { type: Number, default: 0 },
     difference: { type: Number, default: 0 },

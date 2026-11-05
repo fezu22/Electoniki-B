@@ -28,6 +28,127 @@ test('verifyTenantAccess strictly enforces matching shopId', () => {
   assert.equal(verifyTenantAccess(null, 'shop_1'), false);
 });
 
+test('expense receipt can be saved, downloaded, replaced and remains tenant scoped', async () => {
+  resetInMemoryStateForTests();
+  const server = await new Promise((resolve) => {
+    const instance = createApp().listen(0, '127.0.0.1', () => resolve(instance));
+  });
+  const base = `http://127.0.0.1:${server.address().port}/api`;
+  const api = async (path, { method = 'GET', token = '', body } = {}) => {
+    const response = await fetch(`${base}${path}`, { method, headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) }, body: body === undefined ? undefined : JSON.stringify(body) });
+    return { status: response.status, data: await response.json() };
+  };
+  try {
+    const first = await api('/auth/register-shop', { method: 'POST', body: { shopName: 'Receipt Shop', ownerName: 'Owner', email: 'receipts@example.invalid', password: 'ReceiptPassword123' } });
+    const second = await api('/auth/register-shop', { method: 'POST', body: { shopName: 'Other Shop', ownerName: 'Owner', email: 'other-receipts@example.invalid', password: 'ReceiptPassword123' } });
+    assert.equal(first.status, 201);
+    assert.equal(second.status, 201);
+    const token = first.data.token;
+    const receipt = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jM7sAAAAASUVORK5CYII=';
+    const created = await api('/expenses', { method: 'POST', token, body: { title: 'Electricity', amount: 100, paymentMethod: 'Cash', attachmentName: 'receipt.png', attachmentDataUrl: receipt } });
+    assert.equal(created.status, 201);
+    const id = created.data.expense.id;
+    const bootstrap = await api('/bootstrap', { token });
+    const listed = bootstrap.data.expenses.find((expense) => expense.id === id);
+    assert.equal(listed.hasAttachment, true);
+    assert.equal(listed.attachmentDataUrl, undefined);
+    assert.equal((await api(`/expenses/${id}/attachment`, { token })).data.dataUrl, receipt);
+    assert.equal((await api(`/expenses/${id}/attachment`, { token: second.data.token })).status, 404);
+    assert.equal((await api(`/expenses/${id}`, { method: 'PUT', token, body: { attachmentName: 'replacement.png', attachmentDataUrl: receipt } })).status, 200);
+    assert.equal((await api(`/expenses/${id}/attachment`, { token })).data.name, 'replacement.png');
+    assert.equal((await api(`/expenses/${id}`, { method: 'PUT', token, body: { attachmentName: '', attachmentDataUrl: '' } })).status, 200);
+    assert.equal((await api(`/expenses/${id}/attachment`, { token })).status, 404);
+    const stock = await api('/stock-receipts', { method: 'POST', token, body: {
+      supplier: 'Receipt Supplier', invoiceNo: 'INV-TEST', invoiceDate: '2026-11-04', invoiceTotal: 100,
+      items: [{ name: 'Fan', qty: 1, cost: 100, price: 150 }], paymentMethod: 'credit', paidNow: 0,
+      documentName: 'invoice.png', documentType: 'image/png', documentDataUrl: receipt,
+    } });
+    assert.equal(stock.status, 201);
+    const stockId = stock.data.receipt.id;
+    const stockBootstrap = await api('/bootstrap', { token });
+    const listedStock = stockBootstrap.data.stockReceipts.find((entry) => entry.id === stockId);
+    assert.equal(listedStock.hasDocument, true);
+    assert.equal(listedStock.documentDataUrl, undefined);
+    assert.equal((await api(`/stock-receipts/${stockId}/document`, { token })).data.dataUrl, receipt);
+    assert.equal((await api(`/stock-receipts/${stockId}/document`, { token: second.data.token })).status, 404);
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test('invoice ditto marks repeat descriptions and retain each row model and values', async () => {
+  const { normalizeInvoiceDraft } = await import('../utils/invoiceOcr.js');
+  const draft = normalizeInvoiceDraft({ items: [
+    { name: 'Diamond washing machine Model 202', model: '202', qty: 3, cost: 13800, lineTotal: 41400 },
+    { name: 'Model 222', model: '222', descriptionDitto: true, qty: 5, cost: 14800, lineTotal: 74000 },
+    { name: 'Model 333', model: '333', descriptionMarks: '///', qty: 2, cost: 16000, lineTotal: 32000 },
+    { name: 'Model 550', descriptionMarks: '////', qty: 10, cost: 14200, lineTotal: 142000 },
+    { name: '//', model: '444', qty: 4, cost: 11800, lineTotal: 47200 },
+    { name: 'Other appliance', model: 'A/500', qty: 7, cost: 12000, lineTotal: 84000 },
+  ] });
+  assert.deepEqual(draft.items.slice(0, 5).map((item) => item.name), [
+    'Diamond washing machine Model 202', 'Diamond washing machine - Model 222',
+    'Diamond washing machine - Model 333', 'Diamond washing machine - Model 550',
+    'Diamond washing machine - Model 444',
+  ]);
+  assert.deepEqual(draft.items.slice(0, 5).map((item) => [item.qty, item.cost, item.lineTotal]), [
+    [3, 13800, 41400], [5, 14800, 74000], [2, 16000, 32000], [10, 14200, 142000], [4, 11800, 47200],
+  ]);
+  assert.equal(draft.items[5].name, 'Other appliance - Model A/500');
+  assert.equal(draft.items[5].descriptionDitto, false);
+  const separate = normalizeInvoiceDraft({ items: [{ name: '//', model: '999', qty: 1, cost: 10 }] });
+  assert.equal(separate.items[0].name, '');
+  assert.ok(separate.warnings.some((warning) => warning.includes('without a readable product description')));
+});
+
+test('browser origin checks and password changes protect existing sessions', async () => {
+  resetInMemoryStateForTests();
+  const server = await new Promise((resolve) => {
+    const instance = createApp().listen(0, '127.0.0.1', () => resolve(instance));
+  });
+  const origin = `http://127.0.0.1:${server.address().port}`;
+  const request = (path, options = {}) => fetch(`${origin}/api${path}`, options);
+  try {
+    const crossOrigin = await request('/auth/login', {
+      method: 'POST', headers: { Origin: 'https://attacker.invalid', 'Content-Type': 'application/json' }, body: '{}',
+    });
+    assert.equal(crossOrigin.status, 403);
+    const crossSite = await request('/auth/logout', { method: 'POST', headers: { 'Sec-Fetch-Site': 'cross-site' } });
+    assert.equal(crossSite.status, 403);
+    const registration = await request('/auth/register-shop', {
+      method: 'POST', headers: { Origin: origin, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ shopName: 'Security Shop', ownerName: 'Owner', email: 'security@example.invalid', password: 'InitialPassword123' }),
+    });
+    assert.equal(registration.status, 201);
+    assert.equal(registration.headers.get('x-content-type-options'), 'nosniff');
+    assert.equal(registration.headers.get('cache-control'), 'no-store');
+    const session = await registration.json();
+    const change = await request(`/users/${session.user.id}`, {
+      method: 'PUT', headers: { Origin: origin, Authorization: `Bearer ${session.token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ newPassword: 'UpdatedPassword123' }),
+    });
+    assert.equal(change.status, 200);
+    const changedUser = await change.json();
+    assert.ok(changedUser.token);
+    const oldSession = await request('/auth/me', { headers: { Authorization: `Bearer ${session.token}` } });
+    assert.equal((await oldSession.json()).authenticated, false);
+    const protectedRequest = await request('/bootstrap', { headers: { Authorization: `Bearer ${session.token}` } });
+    assert.equal(protectedRequest.status, 403);
+    assert.equal((await request('/bootstrap', { headers: { Authorization: `Bearer ${changedUser.token}` } })).status, 200);
+    const login = await request('/auth/login', {
+      method: 'POST', headers: { Origin: origin, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'security@example.invalid', password: 'UpdatedPassword123' }),
+    });
+    assert.equal(login.status, 200);
+    const freshSession = await login.json();
+    assert.equal((await request('/bootstrap', { headers: { Authorization: `Bearer ${freshSession.token}` } })).status, 200);
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
 test('calculateSaleTotals handles partial cash payments and unpaid udhaar accurately', () => {
   // Partial cash sale (unpaid balance goes to balance/udhaar, never counted as cashCollected)
   const partialCash = calculateSaleTotals({
@@ -567,8 +688,6 @@ test('Multi-tenant isolation, RBAC permissions, sales, returns, installments, an
 test('Gallery invoice upload remains a draft, accepts large images, and posts only on confirmation', async () => {
   resetInMemoryStateForTests();
   const { db } = await import('../db.js');
-  const oldKey = process.env.GEMINI_API_KEY;
-  delete process.env.GEMINI_API_KEY;
   const server = await new Promise((resolve) => {
     const listener = createApp().listen(0, '127.0.0.1', () => resolve(listener));
   });
@@ -676,7 +795,6 @@ test('Gallery invoice upload remains a draft, accepts large images, and posts on
     assert.equal(uploadedReceipt.documentDataUrl, undefined);
     assert.equal(uploadedReceipt.hasDocument, true);
   } finally {
-    if (oldKey === undefined) delete process.env.GEMINI_API_KEY; else process.env.GEMINI_API_KEY = oldKey;
     server.closeAllConnections();
     await new Promise((resolve) => server.close(resolve));
   }
@@ -709,6 +827,9 @@ test('Urdu invoice drafts separate totals and flag unclear handwriting without i
  assert.equal(modelDraft.items[0].codeType,'model');
  assert.equal(modelDraft.items[1].name,'Fan model 550', 'model should not be duplicated in item names');
  assert.equal(modelDraft.items[2].code,'', 'HSN values must still be discarded');
+ const modelOnlyName=normalizeInvoiceDraft({items:[{name:'Model 555',model:'555',qty:5,cost:18000,lineTotal:90000}]});
+ assert.equal(modelOnlyName.items[0].name,'');
+ assert.equal(modelOnlyName.items[0].model,'555');
  const uncertainModel=normalizeInvoiceDraft({items:[{name:'Fan',model:'',qty:1,cost:100,lineTotal:100,confidence:{name:'high',model:'low',qty:'high',cost:'high',lineTotal:'high'}}]});
  assert.match(uncertainModel.items[0].reviewNote,/verify unclear model/);
 });

@@ -15,6 +15,8 @@ export function signedNum(v) {
 
 export function calculateCashSessionTotals(transactions, session, endTime = Date.now()) {
   const start = new Date(session.openedAt).getTime();
+  const businessDayEnd = pakistanDayEnd(session.openedAt);
+  const effectiveEndTime = Math.min(endTime, businessDayEnd);
   let cashIn = 0;
   let cashOut = 0;
   const cashInByType = {};
@@ -22,7 +24,7 @@ export function calculateCashSessionTotals(transactions, session, endTime = Date
   for (const transaction of transactions) {
     if (String(transaction.method || '').toLowerCase() !== 'cash') continue;
     const createdAt = new Date(transaction.createdAt || 0).getTime();
-    if (!Number.isFinite(createdAt) || createdAt < start || createdAt > endTime) continue;
+    if (!Number.isFinite(createdAt) || createdAt < start || createdAt > effectiveEndTime) continue;
     const amount = num(transaction.amount);
     const type = String(transaction.type || 'other_cash_movement');
     if (transaction.direction === 'in') {
@@ -41,6 +43,17 @@ export function calculateCashSessionTotals(transactions, session, endTime = Date
     cashOutByType,
     expectedClosingAmount: num(session.openingAmount) + cashIn - cashOut,
   };
+}
+
+function pakistanDayEnd(value) {
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return 0;
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Karachi', year: 'numeric', month: '2-digit', day: '2-digit',
+  }).formatToParts(date);
+  const values = Object.fromEntries(parts.filter((part) => part.type !== 'literal').map(({ type, value: partValue }) => [type, partValue]));
+  const nextDayStartUtc = Date.UTC(Number(values.year), Number(values.month) - 1, Number(values.day) + 1) - 5 * 60 * 60 * 1000;
+  return nextDayStartUtc - 1;
 }
 
 const STOCK_WARRANTY_OPTIONS = new Set(Array.from({ length: 16 }, (_, index) => `${(index + 1) * 3} Months`));
@@ -530,7 +543,7 @@ export function calculateShopFinancialSummary({
   const stockUnits = products.reduce((s, p) => s + num(p.stock), 0);
   const stockCostValuation = products.reduce((s, p) => s + num(p.cost) * num(p.stock), 0);
   const stockRetailValuation = products.reduce((s, p) => s + num(p.price) * num(p.stock), 0);
-  const lowStockCount = products.filter((p) => num(p.stock) <= num(p.reorderThreshold || 5)).length;
+  const lowStockCount = products.filter((p) => num(p.stock) <= num(p.reorderThreshold ?? 5)).length;
 
   return {
     todaySales,

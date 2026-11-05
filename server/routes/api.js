@@ -1,8 +1,8 @@
-import { INVOICE_OCR_PROMPT, normalizeInvoiceDraft } from '../utils/invoiceOcr.js';
+import { normalizeInvoiceDraft } from '../utils/invoiceOcr.js';
+import { INVOICE_OCR_PROMPT } from '../utils/invoiceOcrPrompt.js';
 import express from 'express';
 import crypto from 'crypto';
 import nodemailer from 'nodemailer';
-import { GoogleGenAI } from '@google/genai';
 import { db, runInTransaction } from '../db.js';
 import { matchProduct, normalizeKey } from '../utils/productMatching.js';
 import {
@@ -13,6 +13,7 @@ import {
   signAuthToken,
   extractToken,
   verifyAuthToken,
+  tokenMatchesUser,
   requireAuth,
   requireOwner,
   requireSuperAdmin,
@@ -37,6 +38,14 @@ const pakistanDateString = (date = new Date()) =>
   new Intl.DateTimeFormat('en-CA', {
     timeZone: 'Asia/Karachi', year: 'numeric', month: '2-digit', day: '2-digit',
   }).format(date);
+
+function pakistanDayEndTimestamp(value) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Karachi', year: 'numeric', month: '2-digit', day: '2-digit',
+  }).formatToParts(new Date(value));
+  const dateParts = Object.fromEntries(parts.filter((part) => part.type !== 'literal').map(({ type, value: partValue }) => [type, partValue]));
+  return Date.UTC(Number(dateParts.year), Number(dateParts.month) - 1, Number(dateParts.day) + 1) - 5 * 60 * 60 * 1000 - 1;
+}
 
 function isValidDateOnly(value) {
   return /^\d{4}-\d{2}-\d{2}$/.test(String(value || '')) &&
@@ -118,7 +127,7 @@ apiRouter.get('/auth/me', async (req, res) => {
       return res.json({ authenticated: false });
     }
     const user = await db.User.findOne({ _id: decoded.sub, shopId: decoded.shopId });
-    if (!user || user.active === false) {
+    if (!user || user.active === false || !tokenMatchesUser(decoded, user)) {
       return res.json({ authenticated: false });
     }
     const shop = await db.Shop.findById(user.shopId);
@@ -229,7 +238,7 @@ apiRouter.post('/auth/register-shop', async (req, res) => {
       shop: result.shop,
     });
   } catch (err) {
-    return res.status(500).json({ error: err.message || 'Could not register shop.' });
+    return res.status(500).json({ error: 'Could not register shop.' });
   }
 });
 
@@ -680,6 +689,7 @@ async function buildShopBootstrap(shopId, currentUser, period = 'all', date = ''
     customerReturns,
     heldOrders,
     auditEvents,
+    openCashSession,
   ] = await Promise.all([
     db.Shop.findById(shopId),
     db.User.find({ shopId }),
@@ -698,6 +708,7 @@ async function buildShopBootstrap(shopId, currentUser, period = 'all', date = ''
     db.CustomerReturn.find({ shopId }),
     db.HeldOrder.find({ shopId }),
     db.AuditEvent.find({ shopId }, { sort: { createdAt: -1 }, limit: 60 }),
+    db.CashSession.findOne({ shopId, status: 'open' }),
   ]);
 
   const supplierPayments = financialTransactions.filter((t) => t.type === 'supplier_payment');
@@ -717,6 +728,12 @@ async function buildShopBootstrap(shopId, currentUser, period = 'all', date = ''
     financialTransactions,
     ...pakistanPeriodBounds(period, date),
   });
+  // Physical cash is only known for a day whose opening count was recorded.
+  // Do not present an all-time ledger estimate as drawer cash when no session is open today.
+  const todayKey = pakistanDateString();
+  summary.cashInHand = openCashSession && pakistanDateString(new Date(openCashSession.openedAt)) === todayKey
+    ? calculateCashSessionTotals(financialTransactions, openCashSession).expectedClosingAmount
+    : null;
 
   const users = usersRaw.map((u) => ({
     id: u.id,
@@ -946,7 +963,11 @@ apiRouter.put('/users/:id', requireOwner, async (req, res) => {
       `Updated user "${updated.name}" (active: ${updated.active})`
     );
 
+    const renewedToken = patch.passwordHash && String(updated.id) === String(req.user.id) ? signAuthToken(updated) : '';
+    if (renewedToken) setAuthCookie(res, renewedToken);
+
     return res.json({
+      ...(renewedToken ? { token: renewedToken } : {}),
       user: {
         id: updated.id,
         shopId: updated.shopId,
@@ -1579,7 +1600,7 @@ apiRouter.post('/sales', async (req, res) => {
 
     return res.status(201).json(result);
   } catch (err) {
-    return res.status(err.status || 500).json({ error: err.message || 'Failed to save sale.' });
+    return res.status(err.status || 500).json({ error: err.status && err.status < 500 ? err.message : 'Failed to save sale.' });
   }
 });
 
@@ -1782,7 +1803,7 @@ apiRouter.post('/installments/plans', async (req, res) => {
 
     return res.status(201).json(result);
   } catch (err) {
-    return res.status(500).json({ error: err.message || 'Failed to add installment customer.' });
+    return res.status(500).json({ error: 'Failed to add installment customer.' });
   }
 });
 
@@ -1916,7 +1937,7 @@ apiRouter.post('/installments/:planId/pay', async (req, res) => {
 
     return res.status(201).json(result);
   } catch (err) {
-    return res.status(err.status || 500).json({ error: err.status ? err.message : err.message || 'Failed to record installment payment.' });
+    return res.status(err.status || 500).json({ error: err.status && err.status < 500 ? err.message : 'Failed to record installment payment.' });
   }
 });
 
@@ -1926,7 +1947,7 @@ apiRouter.post('/installments/:planId/pay', async (req, res) => {
 
 apiRouter.post('/ocr/invoice', async (req, res) => {
   try {
-    const { dataUrl, fileName = 'invoice.jpg', mimeType = 'image/jpeg' } = req.body || {};
+    const { dataUrl, detailDataUrl = '', textDataUrl = '', headerDataUrl = '', fileName = 'invoice.jpg', mimeType = 'image/jpeg' } = req.body || {};
     const documentMatch = typeof dataUrl === 'string' && dataUrl.match(/^data:(image\/(?:jpeg|png|webp)|application\/pdf);base64,([A-Za-z0-9+/]+={0,2})$/);
     if (!documentMatch || documentMatch[1] !== mimeType) {
       return res.status(400).json({ error: 'Upload a JPEG, PNG, WebP image or PDF with a matching document type.' });
@@ -1934,54 +1955,149 @@ apiRouter.post('/ocr/invoice', async (req, res) => {
     if (Buffer.from(documentMatch[2], 'base64').length > 10 * 1024 * 1024) {
       return res.status(413).json({ error: 'Invoice document must be 10 MB or smaller.' });
     }
+    const detailMatch = detailDataUrl
+      ? typeof detailDataUrl === 'string' && detailDataUrl.match(/^data:image\/(?:jpeg|png|webp);base64,([A-Za-z0-9+/]+={0,2})$/)
+      : null;
+    if (detailDataUrl && !detailMatch) {
+      return res.status(400).json({ error: 'Invoice detail image must be a JPEG, PNG, or WebP image.' });
+    }
+    if (detailMatch && Buffer.from(detailMatch[1], 'base64').length > 5 * 1024 * 1024) {
+      return res.status(413).json({ error: 'Invoice detail image must be 5 MB or smaller.' });
+    }
+    const textMatch = textDataUrl
+      ? typeof textDataUrl === 'string' && textDataUrl.match(/^data:image\/(?:jpeg|png|webp);base64,([A-Za-z0-9+/]+={0,2})$/)
+      : null;
+    if (textDataUrl && !textMatch) {
+      return res.status(400).json({ error: 'Invoice handwriting detail image must be a JPEG, PNG, or WebP image.' });
+    }
+    if (textMatch && Buffer.from(textMatch[1], 'base64').length > 5 * 1024 * 1024) {
+      return res.status(413).json({ error: 'Invoice handwriting detail image must be 5 MB or smaller.' });
+    }
+    const headerMatch = headerDataUrl
+      ? typeof headerDataUrl === 'string' && headerDataUrl.match(/^data:image\/(?:jpeg|png|webp);base64,([A-Za-z0-9+/]+={0,2})$/)
+      : null;
+    if (headerDataUrl && !headerMatch) {
+      return res.status(400).json({ error: 'Invoice header image must be a JPEG, PNG, or WebP image.' });
+    }
+    if (headerMatch && Buffer.from(headerMatch[1], 'base64').length > 5 * 1024 * 1024) {
+      return res.status(413).json({ error: 'Invoice header image must be 5 MB or smaller.' });
+    }
 
     const isPdf = String(mimeType).includes('pdf') || String(fileName).toLowerCase().endsWith('.pdf');
 
-    // Attempt Gemini Vision OCR extraction if GEMINI_API_KEY is available and valid
-    const apiKey = (process.env.GEMINI_API_KEY || '').trim();
+    // Invoice OCR goes directly to the Google Gemini API (Google AI Studio).
+    const geminiApiKey = (process.env.GEMINI_API_KEY || '').trim();
+    const apiKey = geminiApiKey !== 'MY_GEMINI_API_KEY' ? geminiApiKey : '';
+    const models = [...new Set([String(process.env.GEMINI_MODEL || process.env.GEMINI_INVOICE_MODEL || 'gemini-3.8-flash').trim(), 'gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-3.6-flash', 'gemini-3.5-flash-lite'])];
     let ocrFailure = '';
-    const hasRealKey = apiKey && apiKey !== 'MY_GEMINI_API_KEY' && dataUrl && dataUrl.startsWith('data:image/');
+    const hasRealKey = Boolean(apiKey && dataUrl && dataUrl.startsWith('data:image/'));
 
     if (hasRealKey) {
-      const ai = new GoogleGenAI({ apiKey });
-      const base64Data = dataUrl.split(',')[1];
-      const configuredModel = String(process.env.GEMINI_MODEL || 'gemini-3.8-flash').trim();
-      const models = [...new Set([configuredModel, 'gemini-3.6-flash', 'gemini-3.5-flash-lite'])];
-      let lastError;
-      for (const model of models) {
-        try {
-          const response = await ai.models.generateContent({
-            model,
-            config: {
-              responseMimeType: 'application/json',
-              httpOptions: { timeout: 22000, retryOptions: { attempts: 1 } },
-            },
-            contents: [
-              { inlineData: { mimeType: mimeType || 'image/jpeg', data: base64Data } },
-              { text: INVOICE_OCR_PROMPT },
-            ],
-          });
-          const text = response.text || '';
-          const jsonMatch = text.match(/\{[\s\S]*\}/);
-          if (!jsonMatch) throw new Error('OCR returned no structured invoice data.');
-          const draft = normalizeInvoiceDraft(JSON.parse(jsonMatch[0]));
-          return res.json({
-            ocrStatus: 'extracted',
-            limitationNote: ['Invoice draft extracted. Review all fields against the original before confirming.', ...draft.warnings].join(' '),
-            draft,
-          });
-        } catch (error) {
-          lastError = error;
-          const status = Number(error.status);
-          const retryable = [429, 500, 502, 503, 504].includes(status) || /timeout|deadline|abort|temporar|no structured/i.test(error.message || '');
-          if (!retryable) break;
+      try {
+        const requestInvoiceDraft = async (prompt) => {
+          let lastError;
+          for (const model of models) {
+            try {
+              const imageParts = [
+                { type: 'text', text: prompt },
+                { type: 'image_url', image_url: { url: dataUrl } },
+                ...(headerMatch ? [
+                  { type: 'text', text: 'Zoomed crop of this same invoice header. Read the supplier name, invoice number, and date from this crop; do not treat it as another document.' },
+                  { type: 'image_url', image_url: { url: headerDataUrl } },
+                ] : []),
+                ...(detailMatch ? [
+                  { type: 'text', text: 'This is an enlarged crop of the full product table from the same invoice. Use the ruled rows and printed column headers to read quantities, rates, and amounts; it is not a separate invoice.' },
+                  { type: 'image_url', image_url: { url: detailDataUrl } },
+                ] : []),
+                ...(textMatch ? [
+                  { type: 'text', text: 'This is a zoomed crop of the product-description column from the same invoice. Translate Urdu descriptions into English and preserve source script in originalName.' },
+                  { type: 'image_url', image_url: { url: textDataUrl } },
+                ] : []),
+              ];
+              const requestBody = {
+                contents: [{ role: 'user', parts: imageParts.map((part) => part.type === 'text'
+                  ? { text: part.text }
+                  : { inline_data: { mime_type: part.image_url.url.match(/^data:([^;]+);base64,/)?.[1] || 'image/jpeg', data: part.image_url.url.split(',')[1] } }) }],
+                generationConfig: { temperature: 0, maxOutputTokens: 7000, responseMimeType: 'application/json' },
+              };
+              const response = await fetch(
+                `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+                method: 'POST',
+                headers: { 'x-goog-api-key': apiKey, 'Content-Type': 'application/json' },
+                body: JSON.stringify(requestBody),
+                signal: AbortSignal.timeout(45000),
+              });
+              if (!response.ok) {
+                const errorBody = await response.json().catch(() => ({}));
+                const providerMessage = String(errorBody?.error?.message || errorBody?.message || '').replaceAll(apiKey, '[redacted]').slice(0, 240);
+                const error = new Error(providerMessage || `Google AI Studio returned HTTP ${response.status}.`);
+                error.status = response.status;
+                throw error;
+              }
+              const result = await response.json();
+              const content = (result.candidates?.[0]?.content?.parts || []).map((part) => part?.text || '').join('\n');
+              const responseText = Array.isArray(content) ? content.map((part) => part?.text || '').join('\n') : content;
+              const jsonMatch = String(responseText).match(/\{[\s\S]*\}/);
+              if (!jsonMatch) throw new Error('OCR returned no structured invoice data.');
+              return normalizeInvoiceDraft(JSON.parse(jsonMatch[0]));
+            } catch (error) {
+              lastError = error;
+              const status = Number(error.status);
+              const retryable = [404, 429, 500, 502, 503, 504].includes(status) || /timeout|deadline|abort|temporar|no structured/i.test(error.message || '');
+              if (!retryable) break;
+            }
+          }
+          throw lastError || new Error('Invoice extraction failed.');
+        };
+
+        let draft = await requestInvoiceDraft(INVOICE_OCR_PROMPT);
+        if (!draft.items.length) {
+          const focusedPrompt = `${INVOICE_OCR_PROMPT}\n\nThe first pass returned no rows. Reinspect the page and table once more. Include a product-like row for review when its description/model and at least one row value are visible. Never create a product from an amount alone. If quantity or rate is unreadable, leave only that field blank/null and explain the uncertainty instead of dropping the whole row.`;
+          draft = await requestInvoiceDraft(focusedPrompt);
         }
+        if (draft.items.length) {
+          const firstPass = draft;
+          const auditPrompt = `${INVOICE_OCR_PROMPT}\n\nPerform an independent second read directly from the full page and all zoomed crops of this same invoice. Ignore values and rows suggested by the first read. Re-read every populated ruled row from top to bottom, including rows below handwritten subtotals. Include a product row for review when its description/model and at least one row value are visible; leave unreadable fields blank and explain them. Never use neighboring rows, totals, or another invoice as a substitute. Re-read the header invoice number, date, and every model/code character by character, checking the printed column headings before assigning any number to a field. For any code containing a slash, preserve the complete prefix and suffix on both sides, including all characters after the slash; do not omit or relocate the suffix. Preserve each written quantity, rate, amount, slash, and leading zero exactly. Return the complete invoice JSON.`;
+          try {
+            const auditedDraft = await requestInvoiceDraft(auditPrompt);
+            if (auditedDraft.items.length >= firstPass.items.length) {
+              draft = auditedDraft;
+            } else {
+              draft = {
+                ...firstPass,
+                warnings: [...new Set([
+                  ...firstPass.warnings,
+                  'A second table review returned fewer product rows, so the first extraction was retained. Check the numbered rows after any handwritten subtotal.',
+                ])],
+              };
+            }
+          } catch {
+            draft = {
+              ...firstPass,
+              warnings: [...new Set([
+                ...firstPass.warnings,
+                'The second table review could not finish; verify any uncertain rows against the original.',
+              ])],
+            };
+          }
+        }
+        if (!draft.items.length) draft.warnings.push('No product rows could be read. Use Retry or enter the rows manually.');
+        return res.json({
+          ocrStatus: 'extracted',
+          limitationNote: ['Invoice draft extracted. Review all fields against the original before confirming.', ...draft.warnings].join(' '),
+          draft,
+        });
+      } catch (error) {
+        const status = Number(error.status);
+        const providerHint = status && status !== 401 && status !== 403 && ![429, 500, 502, 503, 504].includes(status)
+          ? ` (HTTP ${status}: ${String(error.message || '').replaceAll(apiKey, '[redacted]').slice(0, 180)})`
+          : '';
+        ocrFailure = [401, 403].includes(status)
+          ? 'Google AI Studio rejected its API key or model access. Check GEMINI_API_KEY and GEMINI_MODEL in backend/.env.'
+          : [429, 500, 502, 503, 504].includes(status) || /timeout|deadline|abort|temporar/i.test(error.message || '')
+            ? 'Automatic invoice reading is temporarily busy. Try again shortly; no stock was saved.'
+            : `Automatic invoice reading failed${providerHint}. Review or enter the items manually; no stock was saved.`;
       }
-      const status = Number(lastError?.status);
-      ocrFailure = [429, 500, 502, 503, 504].includes(status) || /timeout|deadline|abort/i.test(lastError?.message || '')
-        ? 'Automatic invoice reading is temporarily busy across available models. Try again shortly; no stock was saved.'
-        : 'Automatic invoice reading could not reliably read this document. Review or enter the items manually; no stock was saved.';
-      // Fall through to safe draft template with transparent explanation.
     }
 
     if (isPdf) {
@@ -2002,7 +2118,7 @@ apiRouter.post('/ocr/invoice', async (req, res) => {
     return res.json({
       ocrStatus: 'manual_required',
       limitationNote: !apiKey
-        ? 'Automatic invoice reading is not configured. The original invoice is attached; enter its details manually. Stock changes only after confirmation.'
+        ? 'Google AI Studio invoice reading is not configured. Set GEMINI_API_KEY in backend/.env; the original invoice is attached for manual review. Stock changes only after confirmation.'
         : ocrFailure || 'Invoice could not be read. No product data was guessed. Enter the supplier and invoice items manually; inventory will remain unchanged until you confirm.',
       draft: {
         supplier: '',
@@ -2014,6 +2130,16 @@ apiRouter.post('/ocr/invoice', async (req, res) => {
     });
   } catch (err) {
     return res.status(500).json({ error: 'Could not process invoice document.' });
+  }
+});
+
+apiRouter.get('/stock-receipts/:id/document', async (req, res) => {
+  try {
+    const receipt = await db.StockReceipt.findOne({ _id: req.params.id, shopId: req.shopId });
+    if (!receipt?.documentDataUrl) return res.status(404).json({ error: 'Supplier invoice document not found.' });
+    return res.json({ name: receipt.documentName || 'supplier-invoice', dataUrl: receipt.documentDataUrl });
+  } catch {
+    return res.status(500).json({ error: 'Failed to load supplier invoice document.' });
   }
 });
 
@@ -2066,7 +2192,7 @@ apiRouter.post('/stock-receipts', async (req, res) => {
     if (!isValidDateOnly(dateStr)) {
       return res.status(400).json({ error: 'A valid invoice date is required.' });
     }
-    if (!['credit', 'cash', 'bank'].includes(paymentMethod) ||
+    if (!['credit', 'cash', 'bank', 'other'].includes(paymentMethod) ||
         (paymentMethod === 'credit' && validation.paidNow !== 0)) {
       return res.status(400).json({ error: 'Choose a valid payment method. Supplier credit must have zero paid now.' });
     }
@@ -2222,7 +2348,7 @@ apiRouter.post('/stock-receipts', async (req, res) => {
         payment: {
           method: paymentMethod,
           paid: validation.paidNow,
-          bankName: paymentMethod === 'bank' ? bankName || 'HBL' : '',
+          bankName: paymentMethod === 'bank' ? String(bankName).trim() : '',
           reference: String(paymentReference || ''),
           balance: validation.supplierPayableAdded,
         },
@@ -2246,7 +2372,7 @@ apiRouter.post('/stock-receipts', async (req, res) => {
             direction: 'out',
             amount: validation.paidNow,
             method: paymentMethod,
-            bankName: paymentMethod === 'bank' ? bankName || 'HBL' : '',
+            bankName: paymentMethod === 'bank' ? String(bankName).trim() : '',
             reference: paymentReference || cleanInvoiceNo,
             partyName: cleanSupplier,
             relatedId: receiptNo,
@@ -2270,7 +2396,7 @@ apiRouter.post('/stock-receipts', async (req, res) => {
     return res.status(201).json(result);
   } catch (err) {
     return res.status(err.code === 11000 ? 409 : err.status || 500).json({
-      error: err.code === 11000 ? 'Duplicate supplier invoice is blocked.' : err.message || 'Failed to save stock receipt.' });
+      error: err.code === 11000 ? 'Duplicate supplier invoice is blocked.' : err.status && err.status < 500 ? err.message : 'Failed to save stock receipt.' });
   }
 });
 
@@ -2439,7 +2565,7 @@ apiRouter.post('/returns', async (req, res) => {
 
     return res.status(201).json(result);
   } catch (err) {
-    return res.status(err.status || 500).json({ error: err.message || 'Failed to process customer return.' });
+    return res.status(err.status || 500).json({ error: err.status && err.status < 500 ? err.message : 'Failed to process customer return.' });
   }
 });
 
@@ -2622,7 +2748,7 @@ apiRouter.post('/suppliers/:id/pay', async (req, res) => {
     const cleanMethod = String(method || '').toLowerCase();
     const cleanBank = String(bankName || '').trim();
     if (!Number.isFinite(Number(amount)) || payAmt <= 0 || payAmt > num(sup.balancePayable) ||
-        !['cash', 'bank'].includes(cleanMethod) || (cleanMethod === 'bank' && !cleanBank)) {
+        !['cash', 'bank', 'other'].includes(cleanMethod) || (cleanMethod === 'bank' && !cleanBank)) {
       return res.status(400).json({
         error: `Enter a valid cash/bank payment up to Rs. ${num(sup.balancePayable).toLocaleString()} and select a bank when needed.`,
       });
@@ -2670,7 +2796,7 @@ apiRouter.post('/suppliers/:id/pay', async (req, res) => {
 
     return res.status(201).json(result);
   } catch (err) {
-    return res.status(err.status || 500).json({ error: err.status ? err.message : 'Failed to record supplier payment.' });
+    return res.status(err.status || 500).json({ error: err.status && err.status < 500 ? err.message : 'Failed to record supplier payment.' });
   }
 });
 
@@ -2766,7 +2892,17 @@ apiRouter.post('/expenses', async (req, res) => {
 
     return res.status(201).json(result);
   } catch (err) {
-    return res.status(err.status || 500).json({ error: err.status ? err.message : 'Failed to save expense.' });
+    return res.status(err.status || 500).json({ error: err.status && err.status < 500 ? err.message : 'Failed to save expense.' });
+  }
+});
+
+apiRouter.get('/expenses/:id/attachment', async (req, res) => {
+  try {
+    const expense = await db.Expense.findOne({ _id: req.params.id, shopId: req.shopId });
+    if (!expense?.attachmentDataUrl) return res.status(404).json({ error: 'Expense receipt not found.' });
+    return res.json({ name: expense.attachmentName || 'receipt', dataUrl: expense.attachmentDataUrl });
+  } catch {
+    return res.status(500).json({ error: 'Failed to load expense receipt.' });
   }
 });
 
@@ -2778,6 +2914,11 @@ apiRouter.put('/expenses/:id', async (req, res) => {
     }
 
     const { title, category, date, amount, paymentMethod, bankName, description } = req.body || {};
+    const updateAttachment = Object.prototype.hasOwnProperty.call(req.body || {}, 'attachmentDataUrl');
+    if (updateAttachment) {
+      const attachmentCheck = validateAttachment(req.body.attachmentDataUrl);
+      if (!attachmentCheck.valid) return res.status(400).json({ error: attachmentCheck.error });
+    }
     const newTitle = title !== undefined ? String(title).trim() : existing.title;
     const newAmount = amount !== undefined ? num(amount) : num(existing.amount);
     const newMethod = String(paymentMethod || existing.paymentMethod || 'Cash').toLowerCase();
@@ -2811,6 +2952,7 @@ apiRouter.put('/expenses/:id', async (req, res) => {
         date: date || existing.date, amount: newAmount, paymentMethod: newMethod === 'bank' ? 'Bank' : 'Cash',
         bankName: newMethod === 'bank' ? newBank : '',
         description: description !== undefined ? String(description).trim() : existing.description,
+        ...(updateAttachment ? { attachmentDataUrl: String(req.body.attachmentDataUrl || ''), attachmentName: String(req.body.attachmentName || '') } : {}),
         auditHistory: [...(existing.auditHistory || []), historyEntry],
       });
       const tx = await db.FinancialTransaction.findOne({ shopId: req.shopId, type: 'expense', relatedId: existing.id });
@@ -2824,7 +2966,7 @@ apiRouter.put('/expenses/:id', async (req, res) => {
     });
     return res.json(result);
   } catch (err) {
-    return res.status(err.status || 500).json({ error: err.status ? err.message : 'Failed to update expense.' });
+    return res.status(err.status || 500).json({ error: err.status && err.status < 500 ? err.message : 'Failed to update expense.' });
   }
 });
 
@@ -2958,8 +3100,22 @@ apiRouter.put('/cheques/:id/status', async (req, res) => {
 });
 
 apiRouter.get('/cash-register', async (req, res) => {
-  const [openSession, sessions, transactions] = await Promise.all([
-    db.CashSession.findOne({ shopId: req.shopId, status: 'open' }),
+  let openSession = await db.CashSession.findOne({ shopId: req.shopId, status: 'open' });
+  const todayKey = pakistanDateString();
+  const openedDay = openSession ? pakistanDateString(new Date(openSession.openedAt)) : '';
+  if (openSession && openedDay !== todayKey) {
+    const transactionsAtRollover = await db.FinancialTransaction.find({ shopId: req.shopId });
+    const dayEnd = pakistanDayEndTimestamp(openSession.openedAt);
+    const totals = calculateCashSessionTotals(transactionsAtRollover, openSession, dayEnd);
+    await db.CashSession.updateOne({ _id: openSession.id, shopId: req.shopId, status: 'open' }, {
+      status: 'closed', closedAt: new Date(dayEnd).toISOString(), closedBy: 'System (new business day)',
+      autoClosed: true, actualClosingAmount: null, expectedClosingAmount: totals.expectedClosingAmount,
+      difference: null, closingNote: 'Automatically archived at the end of its business day; physical closing cash was not counted.',
+      cashIn: totals.cashIn, cashOut: totals.cashOut,
+    });
+    openSession = null;
+  }
+  const [sessions, transactions] = await Promise.all([
     db.CashSession.find({ shopId: req.shopId }, { sort: { openedAt: -1 }, limit: 10 }),
     db.FinancialTransaction.find({ shopId: req.shopId }),
   ]);
@@ -2985,7 +3141,20 @@ apiRouter.post('/cash-register/open', async (req, res) => {
     return res.status(400).json({ error: 'Enter a valid opening cash amount.' });
   }
   const existing = await db.CashSession.findOne({ shopId: req.shopId, status: 'open' });
-  if (existing) return res.status(409).json({ error: 'A cash register session is already open. Close it before opening another.' });
+  if (existing) {
+    const openedDate = pakistanDateString(new Date(existing.openedAt));
+    const todayDate = pakistanDateString();
+    if (openedDate === todayDate) return res.status(409).json({ error: 'A cash register session is already open for today. Close it before opening another.' });
+    const transactions = await db.FinancialTransaction.find({ shopId: req.shopId });
+    const dayEnd = pakistanDayEndTimestamp(existing.openedAt);
+    const totals = calculateCashSessionTotals(transactions, existing, dayEnd);
+    await db.CashSession.updateOne({ _id: existing.id, shopId: req.shopId, status: 'open' }, {
+      status: 'closed', closedAt: new Date(dayEnd).toISOString(), closedBy: 'System (new business day)',
+      autoClosed: true, actualClosingAmount: null, expectedClosingAmount: totals.expectedClosingAmount,
+      difference: null, closingNote: 'Automatically archived at the end of its business day; physical closing cash was not counted.',
+      cashIn: totals.cashIn, cashOut: totals.cashOut,
+    });
+  }
   const session = await db.CashSession.create({
     shopId: req.shopId,
     status: 'open',
@@ -3114,7 +3283,7 @@ apiRouter.post('/finance/transactions', async (req, res) => {
     });
     return res.status(201).json(result);
   } catch (err) {
-    return res.status(err.status || 500).json({ error: err.status ? err.message : 'Failed to record financial transaction.' });
+    return res.status(err.status || 500).json({ error: err.status && err.status < 500 ? err.message : 'Failed to record financial transaction.' });
   }
 });
 

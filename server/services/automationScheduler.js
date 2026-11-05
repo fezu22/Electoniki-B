@@ -1,3 +1,4 @@
+import mongoose from 'mongoose';
 import { db } from '../db.js';
 import {
   getWhatsAppAutomationConfig,
@@ -116,6 +117,9 @@ export function shouldSendInstallmentReminder(plan, dateKey, monthKey, hour, pay
 }
 
 export async function runAutomationCycle(now = new Date()) {
+  // Skip scheduled work while MongoDB is disconnected or reconnecting. This
+  // also avoids querying through a session that startup cleanup has ended.
+  if (mongoose.connection.readyState !== 1) return;
   if (cycleRunning) return;
   cycleRunning = true;
   try {
