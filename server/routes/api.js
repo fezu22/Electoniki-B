@@ -621,7 +621,6 @@ apiRouter.get('/overview', async (req, res, next) => {
     const summary = calculateShopFinancialSummary({
       bills, returns, expenses, products, suppliers, bankAccounts, installmentPayments,
       openingCash: shop?.openingCash || 0,
-      supplierPayments: financialTransactions.filter((entry) => entry.type === 'supplier_payment'),
       financialTransactions,
     });
     return res.json({
@@ -711,8 +710,6 @@ async function buildShopBootstrap(shopId, currentUser, period = 'all', date = ''
     db.CashSession.findOne({ shopId, status: 'open' }),
   ]);
 
-  const supplierPayments = financialTransactions.filter((t) => t.type === 'supplier_payment');
-
   const safeStockReceipts = stockReceipts.map(({ documentDataUrl, ...receipt }) => ({ ...receipt, hasDocument: Boolean(documentDataUrl) }));
   const safeExpenses = expenses.map(({ attachmentDataUrl, ...expense }) => ({ ...expense, hasAttachment: Boolean(attachmentDataUrl) }));
   const summary = calculateShopFinancialSummary({
@@ -724,7 +721,6 @@ async function buildShopBootstrap(shopId, currentUser, period = 'all', date = ''
     bankAccounts,
     installmentPayments,
     openingCash: shop?.openingCash || 0,
-    supplierPayments,
     financialTransactions,
     ...pakistanPeriodBounds(period, date),
   });

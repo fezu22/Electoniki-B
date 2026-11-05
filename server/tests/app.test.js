@@ -263,7 +263,7 @@ test('installment reminders are sent daily at 8 AM until Khata receives a paymen
   assert.equal(shouldSendInstallmentReminder({ ...plan, whatsappReminderConsent: false }, '2026-10-30', '2026-10', '08'), false);
 });
 
-test('cash register closing reconciles opening cash with cash-only movements in the session', () => {
+test('cash register ignores supplier settlements when reconciling drawer cash', () => {
   const openedAt = '2026-10-29T09:00:00.000Z';
   const totals = calculateCashSessionTotals([
     { type: 'sale_receipt', method: 'cash', direction: 'in', amount: 12000, createdAt: '2026-10-29T10:00:00.000Z' },
@@ -273,10 +273,10 @@ test('cash register closing reconciles opening cash with cash-only movements in 
   ], { openedAt, openingAmount: 3000 }, new Date('2026-10-29T12:00:00.000Z').getTime());
   assert.deepEqual(totals, {
     cashIn: 12000,
-    cashOut: 2500,
+    cashOut: 0,
     cashInByType: { sale_receipt: 12000 },
-    cashOutByType: { supplier_payment: 2500 },
-    expectedClosingAmount: 12500,
+    cashOutByType: {},
+    expectedClosingAmount: 15000,
   });
 });
 
@@ -733,14 +733,14 @@ test('Multi-tenant isolation, RBAC permissions, sales, returns, installments, an
       method: 'cash', amount: 100, createdAt: new Date().toISOString(),
     });
     const liveCashRegister = await api('/cash-register', { token: ownerToken });
-    assert.equal(liveCashRegister.data.current.cashOutByType.supplier_payment, 100);
-    assert.equal(liveCashRegister.data.current.expectedClosingAmount, -80);
+    assert.equal(liveCashRegister.data.current.cashOutByType.supplier_payment, undefined);
+    assert.equal(liveCashRegister.data.current.expectedClosingAmount, 20);
     const closedCashRegister = await api('/cash-register/close', {
       method: 'POST', token: ownerToken, body: { actualClosingAmount: 0 },
     });
     assert.equal(closedCashRegister.status, 200);
     const cashRegisterHistory = await api('/cash-register', { token: ownerToken });
-    assert.equal(cashRegisterHistory.data.sessions[0].cashOutByType.supplier_payment, 100);
+    assert.equal(cashRegisterHistory.data.sessions[0].cashOutByType.supplier_payment, undefined);
 
     const futureDashboard = await api('/bootstrap?period=date&date=9999-01-01', { token: ownerToken });
     assert.equal(futureDashboard.status, 400);

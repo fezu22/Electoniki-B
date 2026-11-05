@@ -23,6 +23,9 @@ export function calculateCashSessionTotals(transactions, session, endTime = Date
   const cashOutByType = {};
   for (const transaction of transactions) {
     if (String(transaction.method || '').toLowerCase() !== 'cash') continue;
+    // Supplier settlements can be paid from funds kept outside the shop drawer.
+    // They still update supplier and finance ledgers, but do not reconcile drawer cash.
+    if (transaction.type === 'supplier_payment') continue;
     const createdAt = new Date(transaction.createdAt || 0).getTime();
     if (!Number.isFinite(createdAt) || createdAt < start || createdAt > effectiveEndTime) continue;
     const amount = num(transaction.amount);
@@ -422,7 +425,6 @@ export function calculateShopFinancialSummary({
   bankAccounts = [],
   installmentPayments = [],
   openingCash = 0,
-  supplierPayments = [],
   financialTransactions = [],
   fromDate = null,
   toDate = null,
@@ -519,17 +521,12 @@ export function calculateShopFinancialSummary({
   const allCashReturnsOut = hasReturnLedger
     ? financialTransactions.filter((t) => t.type === 'return_refund' && t.method === 'cash' && t.direction === 'out').reduce((s, t) => s + num(t.amount), 0)
     : returns.filter((r) => (r.refundMethod || 'cash').toLowerCase() === 'cash').reduce((s, r) => s + num(r.totalReturnAmount), 0);
-  const allCashSupplierOut = supplierPayments
-    .filter((p) => (p.method || 'cash').toLowerCase() === 'cash')
-    .reduce((s, p) => s + num(p.amount), 0);
-
   const cashInHand =
     num(openingCash) +
     allCashSalesIn +
     allCashInstallmentsIn -
     allCashExpensesOut -
-    allCashReturnsOut -
-    allCashSupplierOut;
+    allCashReturnsOut;
 
   const unassignedBankBalance = financialTransactions
     .filter((t) => String(t.method || '').toLowerCase() === 'bank' && !String(t.bankName || '').trim())
