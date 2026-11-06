@@ -24,6 +24,57 @@ export function isWhatsAppAutomationConfigured(env = process.env) {
     config.installmentTemplate && config.lowStockTemplate);
 }
 
+export async function sendWhatsAppDocument({ to, fileName, pdf, caption = '' }, env = process.env) {
+  const config = getWhatsAppAutomationConfig(env);
+  if (!config.accessToken || !config.phoneNumberId || !config.apiVersion) {
+    throw new Error('WhatsApp Cloud API is not configured. Add WHATSAPP_ACCESS_TOKEN and WHATSAPP_PHONE_NUMBER_ID to the backend environment.');
+  }
+  const recipient = normalizeWhatsAppNumber(to);
+  if (!recipient) throw new Error('Customer WhatsApp number is missing or invalid.');
+  if (!Buffer.isBuffer(pdf) || pdf.length === 0 || pdf.length > 10 * 1024 * 1024) {
+    throw new Error('Invoice PDF must be between 1 byte and 10 MiB.');
+  }
+  const safeFileName = String(fileName || 'invoice.pdf').replace(/[^\w.-]/g, '_').slice(0, 120) || 'invoice.pdf';
+
+  const upload = new FormData();
+  upload.append('messaging_product', 'whatsapp');
+  upload.append('type', 'application/pdf');
+  upload.append('file', new Blob([pdf], { type: 'application/pdf' }), safeFileName);
+  const mediaResponse = await fetch(`https://graph.facebook.com/${config.apiVersion}/${config.phoneNumberId}/media`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${config.accessToken}` },
+    body: upload,
+  });
+  const mediaResult = await mediaResponse.json().catch(() => ({}));
+  if (!mediaResponse.ok || !mediaResult.id) {
+    throw new Error(mediaResult?.error?.message || `WhatsApp PDF upload failed (${mediaResponse.status}).`);
+  }
+
+  const messageResponse = await fetch(`https://graph.facebook.com/${config.apiVersion}/${config.phoneNumberId}/messages`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${config.accessToken}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      messaging_product: 'whatsapp',
+      recipient_type: 'individual',
+      to: recipient,
+      type: 'document',
+      document: {
+        id: mediaResult.id,
+        filename: safeFileName,
+        ...(caption ? { caption: String(caption).slice(0, 1024) } : {}),
+      },
+    }),
+  });
+  const messageResult = await messageResponse.json().catch(() => ({}));
+  if (!messageResponse.ok) {
+    throw new Error(messageResult?.error?.message || `WhatsApp could not send the invoice (${messageResponse.status}).`);
+  }
+  return messageResult;
+}
+
 export async function sendWhatsAppTemplate({ to, templateName, parameters }, env = process.env) {
   const config = getWhatsAppAutomationConfig(env);
   if (!config.accessToken || !config.phoneNumberId || !config.apiVersion) {

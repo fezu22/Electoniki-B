@@ -30,7 +30,7 @@ import {
   calculateShopFinancialSummary,
   calculateCashSessionTotals,
 } from '../utils/calculations.js';
-import { isWhatsAppAutomationConfigured, normalizeWhatsAppNumber } from '../utils/whatsappCloud.js';
+import { isWhatsAppAutomationConfigured, normalizeWhatsAppNumber, sendWhatsAppDocument } from '../utils/whatsappCloud.js';
 
 export const apiRouter = express.Router();
 
@@ -383,6 +383,33 @@ apiRouter.post('/auth/reset-password', async (req, res) => {
 // ============================================================================
 
 apiRouter.use(requireAuth);
+
+apiRouter.post('/whatsapp/invoice-document', async (req, res) => {
+  const { invoiceNo, to, fileName, pdfDataUrl, caption } = req.body || {};
+  if (['super_admin', 'overview_viewer'].includes(req.user?.role)) {
+    return res.status(403).json({ error: 'This account cannot send customer invoices.' });
+  }
+  if (typeof pdfDataUrl !== 'string' || !pdfDataUrl) {
+    return res.status(400).json({ error: 'A valid invoice PDF is required.' });
+  }
+  const attachment = validateAttachment(pdfDataUrl, ['application/pdf']);
+  if (!attachment.valid) return res.status(400).json({ error: attachment.error || 'A valid invoice PDF is required.' });
+  try {
+    const invoice = await db.Sale.findOne({ invoiceNo: String(invoiceNo || '').trim(), shopId: req.shopId });
+    if (!invoice) return res.status(404).json({ error: 'This invoice was not found in your shop.' });
+    const savedCustomerNumber = normalizeWhatsAppNumber(invoice.whatsapp || invoice.phone);
+    if (!savedCustomerNumber || savedCustomerNumber !== normalizeWhatsAppNumber(to)) {
+      return res.status(400).json({ error: 'The recipient must match the WhatsApp number saved on this invoice.' });
+    }
+    const encodedPdf = String(pdfDataUrl).split(',')[1].replace(/\s/g, '');
+    const pdf = Buffer.from(encodedPdf, 'base64');
+    const result = await sendWhatsAppDocument({ to: savedCustomerNumber, fileName, pdf, caption });
+    return res.json({ ok: true, messageId: result?.messages?.[0]?.id || null });
+  } catch (err) {
+    const status = /not configured/i.test(err.message) ? 503 : /invalid|missing|must be/i.test(err.message) ? 400 : 502;
+    return res.status(status).json({ error: err.message || 'Could not send the invoice PDF through WhatsApp.' });
+  }
+});
 
 apiRouter.use('/admin', requireSuperAdmin);
 
