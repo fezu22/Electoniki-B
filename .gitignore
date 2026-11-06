@@ -3,6 +3,8 @@ node_modules/
 .env.*
 !.env.example
 .data/
+.wwebjs_auth/
+whatsapp-sessions/
 coverage/
 npm-debug.log*
 yarn-debug.log*

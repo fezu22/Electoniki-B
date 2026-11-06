@@ -1,9 +1,9 @@
 export function normalizeWhatsAppNumber(value) {
   let digits = String(value || '').replace(/\D/g, '');
   if (digits.startsWith('00')) digits = digits.slice(2);
-  if (digits.startsWith('0')) digits = `92${digits.slice(1)}`;
-  else if (digits.startsWith('3') && digits.length === 10) digits = `92${digits}`;
-  return digits.length >= 10 && digits.length <= 15 ? digits : '';
+  if (digits.length === 11 && digits.startsWith('03')) digits = `92${digits.slice(1)}`;
+  else if (digits.length === 10 && digits.startsWith('3')) digits = `92${digits}`;
+  return /^923\d{9}$/.test(digits) ? digits : '';
 }
 
 export function getWhatsAppAutomationConfig(env = process.env) {

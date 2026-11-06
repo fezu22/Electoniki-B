@@ -756,6 +756,8 @@ test('Multi-tenant isolation, RBAC permissions, sales, returns, installments, an
 
 test('Gallery invoice upload remains a draft, accepts large images, and posts only on confirmation', async () => {
   resetInMemoryStateForTests();
+  const previousGeminiKey = process.env.GEMINI_API_KEY;
+  process.env.GEMINI_API_KEY = '';
   const { db } = await import('../db.js');
   const server = await new Promise((resolve) => {
     const listener = createApp().listen(0, '127.0.0.1', () => resolve(listener));
@@ -864,6 +866,8 @@ test('Gallery invoice upload remains a draft, accepts large images, and posts on
     assert.equal(uploadedReceipt.documentDataUrl, undefined);
     assert.equal(uploadedReceipt.hasDocument, true);
   } finally {
+    if (previousGeminiKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = previousGeminiKey;
     server.closeAllConnections();
     await new Promise((resolve) => server.close(resolve));
   }
@@ -1012,6 +1016,155 @@ test('Finance and expense edits keep invoice, bank, and ledger balances in sync'
   } finally {
     server.closeAllConnections();
     await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test('WhatsApp invoice connection is owner-only, shop-isolated, validates the saved number, and sends the PDF through a mock client', async () => {
+  resetInMemoryStateForTests();
+  const { setWhatsAppWebSessionManagerForTests } = await import('../services/whatsappWebSessions.js');
+  const previousEnabled = process.env.WHATSAPP_WEB_ENABLED;
+  process.env.WHATSAPP_WEB_ENABLED = 'true';
+  const sends = [];
+  const links = [];
+  const disconnections = [];
+  let failNextSend = false;
+  const restoreManager = setWhatsAppWebSessionManagerForTests({
+    isEnabled: () => true,
+    getStatus: async (shopId) => ({ enabled: true, status: 'connected', connected: true, phoneNumber: shopId === 'shop-a' ? '923001111111' : '923002222222', qrDataUrl: '' }),
+    link: async (shopId) => { links.push(shopId); return { enabled: true, status: 'qr', connected: false, qrDataUrl: 'data:image/png;base64,cXJ0ZXN0' }; },
+    disconnect: async (shopId) => { disconnections.push(shopId); return { enabled: true, status: 'disconnected', connected: false, qrDataUrl: '' }; },
+    sendInvoiceDocument: async (payload) => {
+      sends.push(payload);
+      if (failNextSend) throw new Error('Mock WhatsApp provider rejected the document.');
+      return { messageId: 'mock-confirmed-message', duplicate: false };
+    },
+  });
+  const server = await new Promise((resolve) => {
+    const listener = createApp().listen(0, '127.0.0.1', () => resolve(listener));
+  });
+  const api = async (path, { method = 'GET', token = '', body } = {}) => {
+    const response = await fetch(`http://127.0.0.1:${server.address().port}/api${path}`, {
+      method,
+      headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    return { status: response.status, data: await response.json() };
+  };
+  try {
+    const first = await api('/auth/register-shop', { method: 'POST', body: { shopName: 'WhatsApp Shop A', ownerName: 'Owner A', email: 'wa-owner-a@test.invalid', password: 'WhatsAppTest123' } });
+    const second = await api('/auth/register-shop', { method: 'POST', body: { shopName: 'WhatsApp Shop B', ownerName: 'Owner B', email: 'wa-owner-b@test.invalid', password: 'WhatsAppTest123' } });
+    assert.equal(first.status, 201);
+    assert.equal(second.status, 201);
+    const ownerToken = first.data.token;
+    const otherOwnerToken = second.data.token;
+    const staffCreated = await api('/users', { method: 'POST', token: ownerToken, body: { name: 'Shop A Staff', email: 'wa-staff-a@test.invalid', password: 'WhatsAppTest123', role: 'shop_account' } });
+    const staffLogin = await api('/auth/login', { method: 'POST', body: { email: 'wa-staff-a@test.invalid', password: 'WhatsAppTest123' } });
+    assert.equal(staffCreated.status, 201);
+    assert.equal(staffLogin.status, 200);
+    const staffToken = staffLogin.data.token;
+
+    assert.equal((await api('/whatsapp/connection/status', { token: staffToken })).status, 403, 'staff cannot view the pairing QR/status');
+    assert.equal((await api('/whatsapp/connection/link', { method: 'POST', token: staffToken })).status, 403, 'staff cannot start pairing');
+    assert.equal((await api('/whatsapp/connection/disconnect', { method: 'POST', token: staffToken })).status, 403, 'staff cannot disconnect the device');
+    const linkA = await api('/whatsapp/connection/link', { method: 'POST', token: ownerToken });
+    const statusB = await api('/whatsapp/connection/status', { token: otherOwnerToken });
+    assert.equal(linkA.status, 200);
+    assert.equal(linkA.data.connection.qrDataUrl, 'data:image/png;base64,cXJ0ZXN0');
+    assert.equal(statusB.data.connection.phoneNumber, '923002222222');
+    assert.deepEqual(links, [first.data.shop.id], 'linking is scoped to the authenticated shop');
+
+    const customer = await api('/customers', { method: 'POST', token: ownerToken, body: { name: 'Saved WA Customer', phone: '03001111111', whatsapp: '+92 300 7654321' } });
+    const product = await api('/products', { method: 'POST', token: ownerToken, body: { name: 'PDF test item', code: 'WA-PDF-1', cost: 50, price: 100, stock: 2 } });
+    const sale = await api('/sales', { method: 'POST', token: staffToken, body: {
+      customerId: customer.data.customer.id,
+      saleType: 'cash',
+      items: [{ productId: product.data.product.id, qty: 1, price: 100 }],
+      salePayment: { method: 'cash', cash: 100 },
+    } });
+    assert.equal(sale.status, 201, sale.data.error);
+    assert.equal(sale.data.sale.whatsapp, '+92 300 7654321', 'the saved WhatsApp is retained when it differs from the phone');
+
+    const pdfDataUrl = 'data:application/pdf;base64,JVBERi0xLjQKJQ==';
+    const payload = { invoiceNo: sale.data.sale.invoiceNo, to: '00923007654321', fileName: 'invoice-test.pdf', pdfDataUrl, caption: 'Invoice attached' };
+    const wrongCustomerNumber = await api('/whatsapp/invoice-document', { method: 'POST', token: staffToken, body: { ...payload, to: '03001111111' } });
+    assert.equal(wrongCustomerNumber.status, 400, 'recipient must match the invoice WhatsApp, not its phone fallback');
+    const crossShop = await api('/whatsapp/invoice-document', { method: 'POST', token: otherOwnerToken, body: payload });
+    assert.equal(crossShop.status, 404, 'another shop cannot send this invoice');
+    const sent = await api('/whatsapp/invoice-document', { method: 'POST', token: staffToken, body: payload });
+    assert.equal(sent.status, 200, sent.data.error);
+    assert.equal(sent.data.messageId, 'mock-confirmed-message');
+    assert.equal(sends.length, 1);
+    assert.equal(sends[0].shopId, first.data.shop.id);
+    assert.equal(sends[0].to, '923007654321');
+    assert.ok(Buffer.isBuffer(sends[0].pdf));
+    assert.equal(sends[0].pdf.toString('ascii').startsWith('%PDF'), true);
+
+    const savedInvoice = await db.Sale.findOne({ invoiceNo: sale.data.sale.invoiceNo, shopId: first.data.shop.id });
+    await db.Sale.updateOne({ _id: savedInvoice.id, shopId: first.data.shop.id }, { whatsapp: '' });
+    const phoneFallback = await api('/whatsapp/invoice-document', { method: 'POST', token: staffToken, body: { ...payload, to: '+92 300 1111111' } });
+    assert.equal(phoneFallback.status, 200, phoneFallback.data.error);
+    assert.equal(sends[1].to, '923001111111', 'the saved invoice phone is used only when WhatsApp is blank');
+    failNextSend = true;
+    const failedSend = await api('/whatsapp/invoice-document', { method: 'POST', token: staffToken, body: { ...payload, to: '03001111111' } });
+    assert.equal(failedSend.status, 502);
+    assert.match(failedSend.data.error, /provider rejected/i);
+
+    const disconnected = await api('/whatsapp/connection/disconnect', { method: 'POST', token: ownerToken });
+    assert.equal(disconnected.status, 200);
+    assert.deepEqual(disconnections, [first.data.shop.id]);
+  } finally {
+    restoreManager();
+    if (previousEnabled === undefined) delete process.env.WHATSAPP_WEB_ENABLED;
+    else process.env.WHATSAPP_WEB_ENABLED = previousEnabled;
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test('WhatsApp Web session manager restores a shop LocalAuth session and sends a PDF document through a mocked client', async () => {
+  const { EventEmitter } = await import('node:events');
+  const fs = await import('node:fs/promises');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const { createWhatsAppWebSessionManager } = await import('../services/whatsappWebSessions.js');
+  const dataPath = await fs.mkdtemp(path.join(os.tmpdir(), 'electrohub-wa-test-'));
+  const env = { WHATSAPP_WEB_ENABLED: 'true' };
+  let initializedClients = 0;
+  let sentDocument = null;
+  const clientFactory = async () => {
+    const client = new EventEmitter();
+    client.info = { wid: { user: '923001234567' } };
+    client.initialize = async () => { initializedClients += 1; client.emit('ready'); };
+    client.getNumberId = async (phone) => ({ _serialized: `${phone}@c.us` });
+    client.sendMessage = async (to, media, options) => {
+      sentDocument = { to, media, options };
+      return { id: { _serialized: 'mock-web-message-id' } };
+    };
+    client.logout = async () => {};
+    client.destroy = async () => {};
+    return client;
+  };
+  try {
+    const firstRun = createWhatsAppWebSessionManager({ env, dataPath, clientFactory, messageMediaFactory: (mimetype, data, filename) => ({ mimetype, data, filename }) });
+    await fs.mkdir(firstRun.sessionPath('tenant-one'), { recursive: true });
+    const restartedRun = createWhatsAppWebSessionManager({ env, dataPath, clientFactory, messageMediaFactory: (mimetype, data, filename) => ({ mimetype, data, filename }) });
+    assert.equal(await restartedRun.restorePersistedSessions(['tenant-one', 'tenant-two']), 1);
+    assert.equal(initializedClients, 1, 'a saved shop session is restored but a tenant without a saved directory is not started');
+    assert.equal((await restartedRun.getStatus('tenant-one')).connected, true);
+    assert.equal((await restartedRun.getStatus('tenant-two')).status, 'disconnected');
+    await assert.rejects(() => restartedRun.sendInvoiceDocument({ shopId: 'tenant-two', invoiceNo: 'INV-OTHER', to: '03001234567', pdf: Buffer.from('%PDF'), fileName: 'other.pdf' }), /no linked WhatsApp device/i);
+    const result = await restartedRun.sendInvoiceDocument({
+      shopId: 'tenant-one', invoiceNo: 'INV-101', to: '03 001 234567', pdf: Buffer.from('%PDF mock invoice'), fileName: 'INV-101.pdf', caption: 'Invoice',
+    });
+    assert.equal(result.messageId, 'mock-web-message-id');
+    assert.equal(sentDocument.to, '923001234567@c.us');
+    assert.equal(sentDocument.media.mimetype, 'application/pdf');
+    assert.equal(sentDocument.media.filename, 'INV-101.pdf');
+    assert.equal(Buffer.from(sentDocument.media.data, 'base64').toString(), '%PDF mock invoice');
+    assert.equal(sentDocument.options.sendMediaAsDocument, true);
+    assert.equal(sentDocument.options.caption, 'Invoice');
+  } finally {
+    await fs.rm(dataPath, { recursive: true, force: true });
   }
 });
 

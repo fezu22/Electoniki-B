@@ -9,6 +9,7 @@ import { connectDatabase, db } from './db.js';
 import { apiRouter } from './routes/api.js';
 import { hashPassword } from './middleware/auth.js';
 import { startAutomationScheduler } from './services/automationScheduler.js';
+import { getWhatsAppWebSessionManager } from './services/whatsappWebSessions.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -104,6 +105,14 @@ export async function startServer() {
     const server = app.listen(port, '0.0.0.0', () => {
       console.log(`ElectroHub SaaS server listening on http://0.0.0.0:${port}`);
       startAutomationScheduler();
+      if (getWhatsAppWebSessionManager().isEnabled()) {
+        // Reopen the per-shop LocalAuth directories in the background so the
+        // API can start serving requests even if Chromium takes time to boot.
+        db.Shop.find({})
+          .then((shops) => getWhatsAppWebSessionManager().restorePersistedSessions(shops.map((shop) => shop.id)))
+          .then((count) => { if (count) console.log(`Restoring ${count} linked WhatsApp shop session(s).`); })
+          .catch((error) => console.error('WhatsApp session restore failed:', error?.message || error));
+      }
       resolve(server);
     });
     server.once('error', (err) => {

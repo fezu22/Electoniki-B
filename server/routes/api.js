@@ -31,6 +31,7 @@ import {
   calculateCashSessionTotals,
 } from '../utils/calculations.js';
 import { isWhatsAppAutomationConfigured, normalizeWhatsAppNumber, sendWhatsAppDocument } from '../utils/whatsappCloud.js';
+import { getWhatsAppWebSessionManager } from '../services/whatsappWebSessions.js';
 
 export const apiRouter = express.Router();
 
@@ -384,6 +385,31 @@ apiRouter.post('/auth/reset-password', async (req, res) => {
 
 apiRouter.use(requireAuth);
 
+apiRouter.get('/whatsapp/connection/status', requireOwner, async (req, res) => {
+  const status = await getWhatsAppWebSessionManager().getStatus(req.shopId);
+  res.setHeader('Cache-Control', 'no-store');
+  return res.json({ connection: status });
+});
+
+apiRouter.post('/whatsapp/connection/link', requireOwner, async (req, res) => {
+  try {
+    const connection = await getWhatsAppWebSessionManager().link(req.shopId);
+    res.setHeader('Cache-Control', 'no-store');
+    return res.json({ connection });
+  } catch (err) {
+    return res.status(503).json({ error: err.message || 'Could not start WhatsApp linking.' });
+  }
+});
+
+apiRouter.post('/whatsapp/connection/disconnect', requireOwner, async (req, res) => {
+  try {
+    const connection = await getWhatsAppWebSessionManager().disconnect(req.shopId);
+    return res.json({ connection });
+  } catch (err) {
+    return res.status(500).json({ error: 'Could not disconnect this shop WhatsApp session.' });
+  }
+});
+
 apiRouter.post('/whatsapp/invoice-document', async (req, res) => {
   const { invoiceNo, to, fileName, pdfDataUrl, caption } = req.body || {};
   if (['super_admin', 'overview_viewer'].includes(req.user?.role)) {
@@ -403,10 +429,21 @@ apiRouter.post('/whatsapp/invoice-document', async (req, res) => {
     }
     const encodedPdf = String(pdfDataUrl).split(',')[1].replace(/\s/g, '');
     const pdf = Buffer.from(encodedPdf, 'base64');
-    const result = await sendWhatsAppDocument({ to: savedCustomerNumber, fileName, pdf, caption });
-    return res.json({ ok: true, messageId: result?.messages?.[0]?.id || null });
+    const webSessions = getWhatsAppWebSessionManager();
+    const result = webSessions.isEnabled()
+      ? await webSessions.sendInvoiceDocument({
+        shopId: req.shopId,
+        invoiceNo: invoice.invoiceNo,
+        to: savedCustomerNumber,
+        fileName,
+        pdf,
+        caption,
+      })
+      : await sendWhatsAppDocument({ to: savedCustomerNumber, fileName, pdf, caption });
+    return res.json({ ok: true, messageId: result?.messageId || result?.messages?.[0]?.id || null, duplicate: Boolean(result?.duplicate) });
   } catch (err) {
-    const status = /not configured/i.test(err.message) ? 503 : /invalid|missing|must be/i.test(err.message) ? 400 : 502;
+    const status = /not configured|disabled|no linked|not ready/i.test(err.message) ? 503
+      : /invalid|missing|must be/i.test(err.message) ? 400 : 502;
     return res.status(status).json({ error: err.message || 'Could not send the invoice PDF through WhatsApp.' });
   }
 });
